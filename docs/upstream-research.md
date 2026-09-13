@@ -222,9 +222,6 @@ spec:
       app: zone-gateway
   action: ALLOW
   rules:
-  - to:
-    - operation:
-        ports: ["8080"]
   - from:
     - source:
         principals: ["poc.example/ns/zone-a/sa/zone-gateway"]
@@ -233,10 +230,7 @@ spec:
         ports: ["8443"]
 ```
 
-The selector must uniquely select the destination gateway. The unconditional
-8080 rule is necessary because the existence of any ALLOW policy changes the
-selected workload to allow-only semantics: a request is denied unless an
-ALLOW rule matches ([evaluation order](https://istio.io/latest/docs/reference/config/security/authorization-policy/#authorization-policy)). An empty incoming list must therefore retain the 8080 rule while omitting every 8443 rule. The policy's `operation.ports` values are strings and match the connection port ([Operation reference](https://istio.io/latest/docs/reference/config/security/authorization-policy/#operation)).
+The selector must uniquely select the destination gateway. A separate baseline policy contains the unconditional 8080 rule. Any matching ALLOW policy changes the selected workload to allow-only semantics ([evaluation order](https://istio.io/latest/docs/reference/config/security/authorization-policy/#authorization-policy)). An empty incoming list produces an empty generated rule list. The independent baseline still permits 8080 and denies 8443, even if the generated policy disappears. The policy's `operation.ports` values are strings and match the connection port ([Operation reference](https://istio.io/latest/docs/reference/config/security/authorization-policy/#operation)). [ADR 0005](adr/0005-independent-istio-baseline.md) records this correction to the initial design.
 
 ## Standalone Envoy: SDS, identity extraction, and external authorization
 
@@ -273,8 +267,7 @@ route to the app.
 3. Render/inject one gateway Pod for the pinned Istio version and assert
    `gateway,spire` produces a regular `istio-proxy` container with the CSI
    mount.
-4. Verify a generated empty-edge policy still has the port-8080 ALLOW rule and
-   no port-8443 rule; issue traffic tests before claiming denial behavior.
+4. Verify that the independent baseline permits only port 8080 and that the generated empty-edge policy has no rules. Test deletion and repair with traffic before claiming denial behavior.
 
 ## Caveats
 

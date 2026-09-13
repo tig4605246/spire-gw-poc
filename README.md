@@ -15,7 +15,7 @@ Apps have one container, no sidecar, no SPIFFE socket, and no certificate code. 
 
 ## Run the POC
 
-Prerequisites: Linux, Docker, Go 1.26, kubectl, Python 3 with PyYAML, curl, OpenSSL, Make, tar, and SHA-256 tools. Docker needs internet access to the image registries. The tool installer supports `amd64` and `arm64`.
+Prerequisites: Linux, Docker, Go 1.26, kubectl, Python 3 with PyYAML, curl, OpenSSL 3, GNU coreutils, Make, tar, and SHA-256 tools. Docker needs internet access to the image registries. The tool installer supports `amd64` and `arm64`.
 
 ```bash
 make tools
@@ -75,6 +75,8 @@ KUBECONFIG="$PWD/.state/istio/kubeconfig" kubectl get authorizationpolicies -A
 
 The gateway certificate identities are `spiffe://poc.example/ns/zone-a/sa/zone-gateway` and the corresponding `zone-b` URI. Istio policy principals omit `spiffe://`. Public certificate inspection never needs private key exports.
 
+The SVID verifier checks the served public certificate chain against the SPIRE bundle and requires the exact gateway URI SAN. A matching CA serial alone does not establish issuer provenance.
+
 ## Versions
 
 [versions.env](versions.env) is the source for tool and image pins. The original design's Kubernetes `v1.34.1` tag was unavailable. The implemented platform uses a published image and a compatible Cilium release.
@@ -116,6 +118,8 @@ If nodes or Pods fail during bootstrap, inspect `docker stats` and `kubectl get 
 This is one kind cluster per mode and one SPIFFE trust domain. It does not demonstrate federation or production availability. Trust is at zone/service-account scope. The plain HTTP call entrypoint is a test harness, not end-user authentication.
 
 Dashboard authentication is omitted for local use. Its Service is accessible through localhost port-forward. Only gateway Pods can reach the separate authorization Service through the declared NetworkPolicy.
+
+Istio has an independent baseline policy that allows only port 8080. If the generated policy disappears, port 8443 denies requests after xDS convergence. The controller can recreate its policy but cannot modify the baseline. [ADR 0005](docs/adr/0005-independent-istio-baseline.md) describes the RBAC and admission boundary.
 
 Istio uses one request per inter-gateway connection on port 8443. This avoids the inconsistent decisions observed with reused connections during rapid policy changes. It adds connection and TLS setup costs; see [the connection-lifetime decision](docs/adr/0004-bound-istio-gateway-connections.md).
 

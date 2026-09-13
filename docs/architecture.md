@@ -237,23 +237,22 @@ Per zone, create:
 - Istio `Gateway` with HTTP port 8080 and `ISTIO_MUTUAL` port 8443;
 - `VirtualService` routes from 8080 to destination gateway Services and from 8443 to the local app Service;
 - `DestinationRule` using `ISTIO_MUTUAL` for destination gateway port 8443;
-- a controller-owned `AuthorizationPolicy` selecting only the gateway workload;
+- an independent baseline `AuthorizationPolicy` and a controller-owned policy, both selecting only the gateway workload;
 - NetworkPolicy that permits the app port only from the local gateway.
 
 ### 7.2 Generated authorization
 
 For each destination zone, reconcile all incoming `ZoneTrust` edges into exactly one generated `AuthorizationPolicy`, named `zone-trust-generated`, in that zone namespace.
 
-The policy has action `ALLOW` and contains:
+The generated policy has action `ALLOW`. Each allowed incoming edge adds one port-`8443` rule with the exact principal `poc.example/ns/<source>/sa/zone-gateway`. Without allowed edges, its rule list is empty.
 
-- one unconditional rule for the POC call-entry port `8080`;
-- one rule per allowed incoming edge on port `8443`, matching the exact Istio source principal `poc.example/ns/<source>/sa/zone-gateway`.
+A separate, bootstrap-owned baseline policy permits only the POC call-entry port `8080`. Bootstrap installs this policy before the gateways. The controller cannot modify it.
 
 Istio omits the URI scheme in its policy representation. The certificate URI retains `spiffe://`. See [ADR 0002](adr/0002-istio-principal-representation.md).
 
-Keeping a single controller-owned policy per destination avoids overlapping generated resources and makes deny-all explicit: when no incoming edge is allowed, only port 8080 remains reachable and every request to 8443 is denied.
+The independent baseline preserves allow-only semantics when the generated policy disappears. After xDS observes deletion, port `8443` denies requests instead of becoming unrestricted. The baseline must remain installed. Cluster administrators can still change or delete it.
 
-The controller uses server-side apply with a dedicated field manager, waits until the written object is observable, then marks each involved `ZoneTrust` generation applied. Drift is repaired during reconcile. It never edits hand-authored authorization policies.
+The controller uses server-side apply with a dedicated field manager. It observes the written object before marking each involved `ZoneTrust` generation applied. Reconciliation repairs drift, including a deleted generated policy. Namespace-scoped RBAC grants creation. A validating admission policy restricts controller writes to the generated policy name. Name-scoped RBAC protects existing baseline and hand-authored policies. See [ADR 0005](adr/0005-independent-istio-baseline.md).
 
 ### 7.3 Identity parsing boundary
 

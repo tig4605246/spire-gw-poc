@@ -10,7 +10,15 @@ Both modes use three Kubernetes `v1.34.11` nodes and Cilium `1.19.0`. SPIRE is `
 
 ## Static checks and builds
 
-`make test` passed. It runs seven Go test functions with table-driven cases, `go vet`, race tests, YAML checks, both deployment overlays, and both Envoy configurations.
+`make test` passed. It runs Go tests, `go vet`, race tests, shell regression tests, YAML checks, both deployment overlays, and both Envoy configurations.
+
+### PR review regressions
+
+The review fixes passed `make test` on 2026-09-13. These checks include an empty generated Istio rule list and the independent baseline, RBAC, and admission manifests.
+
+Synthetic certificate tests accept a valid SPIRE-issued leaf. They reject an unrelated issuer, incorrect URI, invalid key usage, missing client authentication usage, and expiry. The unrelated-issuer case still fails when the presented certificates also contain the trusted SPIRE CA.
+
+The live Istio suite now includes admission enforcement and generated-policy deletion with controller recovery. It waits for active listener configuration to observe deletion before probing the protected port. Those probes require HTTP 403 and an unchanged destination counter. Historical live results below predate these additions; use the current CI artifacts for the expanded suite.
 
 `scripts/generate-api.sh` reproduced the checked-in CRD and deepcopy artifacts. Kubernetes also accepted the generated CRD in server-side validation.
 
@@ -49,7 +57,7 @@ The rotation check observed these public certificate values in the same running 
 
 A second bootstrap on the existing cluster completed in 36.15 seconds. All four app/gateway Pod UIDs remained unchanged. The allowed edge and its applied generation also remained intact.
 
-The identity check also compared each Envoy trust-anchor serial against the SPIRE Server's public bundle. Both gateways matched SPIRE CA serial `6f2cf934c864fed52eeead62ff0d579a`. This supplements the exact URI SAN and successful mTLS traffic checks with issuer provenance.
+The initial identity check matched SPIRE CA serial `6f2cf934c864fed52eeead62ff0d579a` against Envoy trust-anchor metadata. This historical check did not prove the leaf issuer. PR review identified that gap. The updated verifier performs cryptographic chain verification instead.
 
 At one inspection point, Docker reported about 1.26 GiB for the control-plane node and 0.86–0.91 GiB for each worker. These figures exclude build caches and other host processes.
 
@@ -63,7 +71,7 @@ The same functional matrix passed with controller-generated Istio authorization.
 
 Both proxies reported `SYNCED` for CDS, EDS, LDS, and RDS. The live Pod checks found exactly one regular `istio-proxy` container per gateway, with the SPIRE CSI socket mount. Apps remained plain HTTP workloads with one container.
 
-Both gateway trust-anchor serials matched SPIRE's public CA serial `6d47213b69820debff200911c4447ddf`. This proves the configured trust anchor came from SPIRE, alongside successful mTLS traffic and exact URI SAN checks.
+Both gateway trust-anchor serials matched SPIRE CA serial `6d47213b69820debff200911c4447ddf`. This historical metadata match did not establish a cryptographic relationship to the leaf certificate. It is not leaf-issuer evidence.
 
 | Interval | p50 | p95 | Samples |
 | --- | ---: | ---: | ---: |
