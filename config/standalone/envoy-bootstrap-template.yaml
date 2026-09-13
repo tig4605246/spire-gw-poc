@@ -1,0 +1,235 @@
+# Render with scripts/render-envoy.sh. __ZONE__ and __PEER_ZONE__ are never
+# supplied by a network client; the renderer accepts only the two fixed zones.
+node:
+  id: zone-gateway-__ZONE__
+  cluster: zone-gateway-__ZONE__
+static_resources:
+  listeners:
+    - name: call-entry
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: call_entry
+                route_config:
+                  name: call_entry_routes
+                  virtual_hosts:
+                    - name: call_entry
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/call/__PEER_ZONE__/" }
+                          request_headers_to_remove:
+                            - x-spiffe-peer-id
+                            - x-destination-zone
+                            - x-source-zone
+                          route:
+                            cluster: zone-__PEER_ZONE__-gateway
+                            prefix_rewrite: "/"
+                            timeout: 5s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - name: protected-ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                tls_certificate_sds_secret_configs:
+                  - name: default
+                    sds_config:
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: spire_agent }
+                validation_context_sds_secret_config:
+                  name: ROOTCA
+                  sds_config:
+                    api_config_source:
+                      api_type: GRPC
+                      transport_api_version: V3
+                      grpc_services:
+                        - envoy_grpc: { cluster_name: spire_agent }
+              require_client_certificate: true
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: protected_ingress
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /dev/stdout
+                      log_format:
+                        json_format:
+                          source_spiffe_id: "%DYNAMIC_METADATA(zone_trust:source_spiffe_id)%"
+                          destination_zone: "%DYNAMIC_METADATA(zone_trust:destination_zone)%"
+                          response_code: "%RESPONSE_CODE%"
+                          response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          upstream_host: "%UPSTREAM_HOST%"
+                          policy_decision: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:x-zone-trust-decision)%"
+                route_config:
+                  name: protected_ingress_routes
+                  virtual_hosts:
+                    - name: local_app
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          # These are derived only after the validated TLS handshake.
+                          # Remove them after ext-authz so the plain HTTP app cannot
+                          # accidentally use identity as an authorization input.
+                          request_headers_to_remove:
+                            - x-spiffe-peer-id
+                            - x-destination-zone
+                            - x-source-zone
+                          route:
+                            cluster: local-app
+                            timeout: 5s
+                http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function envoy_on_request(request_handle)
+                            local connection = request_handle:streamInfo():downstreamSslConnection()
+                            if connection == nil then
+                              request_handle:respond({[":status"] = "403"}, "missing client TLS identity")
+                              return
+                            end
+                            local uris = connection:uriSanPeerCertificate()
+                            if uris == nil or #uris ~= 1 then
+                              request_handle:respond({[":status"] = "403"}, "invalid client SPIFFE identity")
+                              return
+                            end
+                            local peer = uris[1]
+                            local source_zone = string.match(peer, "^spiffe://poc%.example/ns/([a-z0-9%-]+)/sa/zone%-gateway$")
+                            if source_zone == nil or #source_zone > 63 or string.sub(source_zone, 1, 1) == "-" or string.sub(source_zone, -1) == "-" then
+                              request_handle:respond({[":status"] = "403"}, "unrecognized client SPIFFE identity")
+                              return
+                            end
+                            request_handle:headers():replace("x-spiffe-peer-id", peer)
+                            request_handle:headers():replace("x-destination-zone", "__ZONE__")
+                            request_handle:streamInfo():dynamicMetadata():set("zone_trust", "source_spiffe_id", peer)
+                            request_handle:streamInfo():dynamicMetadata():set("zone_trust", "destination_zone", "__ZONE__")
+                          end
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      failure_mode_allow: false
+                      transport_api_version: V3
+                      status_on_error: { code: ServiceUnavailable }
+                      http_service:
+                        server_uri:
+                          uri: http://zone-trust-authorizer.control-plane.svc.cluster.local:9000
+                          cluster: zone-trust-authorizer
+                          timeout: 0.25s
+                        path_prefix: /check
+                        authorization_request:
+                          allowed_headers:
+                            patterns:
+                              - exact: x-spiffe-peer-id
+                              - exact: x-destination-zone
+                              - exact: :method
+                              - exact: :path
+                        authorization_response:
+                          dynamic_metadata_from_headers:
+                            patterns:
+                              - exact: x-zone-trust-decision
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: spire_agent
+      connect_timeout: 1s
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: spire_agent
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: /run/secrets/workload-spiffe-uds/socket }
+    - name: zone-trust-authorizer
+      type: STRICT_DNS
+      connect_timeout: 0.25s
+      load_assignment:
+        cluster_name: zone-trust-authorizer
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: zone-trust-authorizer.control-plane.svc.cluster.local
+                      port_value: 9000
+    - name: local-app
+      type: STRICT_DNS
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: local-app
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: zone-app.__ZONE__.svc.cluster.local
+                      port_value: 8080
+    - name: zone-__PEER_ZONE__-gateway
+      type: STRICT_DNS
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: zone-__PEER_ZONE__-gateway
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: zone-gateway.__PEER_ZONE__.svc.cluster.local
+                      port_value: 8443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: zone-gateway.__PEER_ZONE__.svc.cluster.local
+          common_tls_context:
+            tls_params:
+              tls_minimum_protocol_version: TLSv1_2
+            tls_certificate_sds_secret_configs:
+              - name: default
+                sds_config:
+                  api_config_source:
+                    api_type: GRPC
+                    transport_api_version: V3
+                    grpc_services:
+                      - envoy_grpc: { cluster_name: spire_agent }
+            combined_validation_context:
+              # Chain validation alone is insufficient: pin the destination
+              # service identity to prevent another valid workload SVID from
+              # impersonating the destination Service DNS name.
+              default_validation_context:
+                match_typed_subject_alt_names:
+                  - san_type: URI
+                    matcher: { exact: spiffe://poc.example/ns/__PEER_ZONE__/sa/zone-gateway }
+              validation_context_sds_secret_config:
+                name: ROOTCA
+                sds_config:
+                  api_config_source:
+                    api_type: GRPC
+                    transport_api_version: V3
+                    grpc_services:
+                      - envoy_grpc: { cluster_name: spire_agent }
+admin:
+  access_log_path: /dev/null
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }

@@ -1,0 +1,4 @@
+resources:
+  - namespaces.yaml
+  - apps.yaml
+  - network-policies.yaml

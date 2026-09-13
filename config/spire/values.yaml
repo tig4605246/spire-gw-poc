@@ -1,0 +1,55 @@
+# Values verified against spiffe/spire chart 0.30.2.
+global:
+  spire:
+    trustDomain: poc.example
+    clusterName: spire-gw-poc
+    namespaces:
+      create: true
+      system:
+        name: spire-system
+        create: true
+      server:
+        name: spire-server
+        create: true
+spire-agent:
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  nodeAttestor:
+    k8sPSAT:
+      enabled: true
+  sds:
+    enabled: true
+    defaultSVIDName: default
+    # The single trust domain bundle is intentionally not named separately.
+    defaultBundleName: ""
+    defaultAllBundlesName: ROOTCA
+  socketAlternate:
+    names:
+      - socket
+  workloadAttestors:
+    k8s:
+      enabled: true
+spire-server:
+  controllerManager:
+    enabled: true
+    identities:
+      # A selector-less fallback would issue identities to app Pods, violating
+      # the plain-HTTP/no-SPIFFE application boundary.
+      clusterSPIFFEIDs:
+        default:
+          enabled: false
+    reconcile:
+      clusterSPIFFEIDs: true
+      clusterStaticEntries: false
+      clusterFederatedTrustDomains: false
+spiffe-csi-driver:
+  enabled: true
+  pluginName: csi.spiffe.io
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+spiffe-oidc-discovery-provider:
+  enabled: false
