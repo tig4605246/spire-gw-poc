@@ -59,6 +59,7 @@ PF_PIDS=()
 PASS=0
 FAIL=0
 CONTROLLER_PORT=
+CONTROLLER_SCALED_DOWN=false
 declare -A APP_PORT=()
 declare -a APPLY_MS=()
 declare -a TRAFFIC_MS=()
@@ -69,6 +70,12 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
+  # A failed outage assertion must not leave the demonstration control plane
+  # unavailable and make later independent checks meaningless. Cleanup errors
+  # never replace the original test failure status.
+  if [[ "$CONTROLLER_SCALED_DOWN" == true ]]; then
+    kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=1 >/dev/null 2>&1 || true
+  fi
   kubectl -n "$E2E_NAMESPACE" delete pod "$CLIENT_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   kubectl -n "$ZONE_A" delete pod "$DIRECT_CLIENT_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
@@ -219,6 +226,12 @@ is_denied_response() {
   [[ ! "$code" =~ ^2[0-9][0-9]$ ]]
 }
 
+is_forbidden_response() {
+  local output=$1 code
+  code=$(printf '%s\n' "$output" | request_code)
+  [[ "$code" == 403 ]]
+}
+
 edge_name() { printf '%s-to-%s' "$1" "$2"; }
 
 reset_test_edges() {
@@ -280,7 +293,7 @@ set_edge_and_wait_for_traffic() {
   while (( SECONDS < deadline )); do
     output=$(gateway_call "$source" "$destination" /e2e-convergence)
     if [[ "$expected" == allow ]] && is_successful_response "$output"; then observed=$(now_ms); break; fi
-    if [[ "$expected" == deny ]] && is_denied_response "$output"; then observed=$(now_ms); break; fi
+    if [[ "$expected" == deny ]] && is_forbidden_response "$output"; then observed=$(now_ms); break; fi
     sleep 0.25
   done
   [[ -n ${observed:-} ]] || return 1
@@ -292,7 +305,7 @@ assert_counter_unchanged_after_denied_call() {
   local source=$1 destination=$2 before output after
   before=$(app_requests "$destination") || return 1
   output=$(gateway_call "$source" "$destination" /e2e-denied) || true
-  is_denied_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
+  is_forbidden_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
   after=$(app_requests "$destination") || return 1
   [[ "$before" == "$after" ]] || fail "denied request reached $destination app ($before -> $after)"
 }
@@ -303,7 +316,7 @@ wait_for_gateway_decision() {
   while (( SECONDS < deadline )); do
     output=$(gateway_call "$source" "$destination" "$path") || true
     if [[ "$expected" == allow ]] && is_successful_response "$output"; then return 0; fi
-    if [[ "$expected" == deny ]] && is_denied_response "$output"; then return 0; fi
+    if [[ "$expected" == deny ]] && is_forbidden_response "$output"; then return 0; fi
     sleep 0.25
   done
   return 1
@@ -363,7 +376,33 @@ test_deleted_edge_deny() {
   runtime_before=$(workload_fingerprint) || return 1
   kubectl delete zonetrust "$(edge_name "$ZONE_A" "$ZONE_B")" >/dev/null || return 1
   printf 'deleted fixture edge: %s\n' "$(edge_name "$ZONE_A" "$ZONE_B")" >>"$STATE_DIR/actions.log" || return 1
-  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-deleted-edge || return 1
+  if [[ "$MODE" == istio ]]; then
+    # A non-2xx response can be a transient xDS/upstream failure. First prove
+    # the generated API policy no longer contains the deleted principal, then
+    # require the destination gateway's RBAC 403 before checking app isolation.
+    local deadline=$((SECONDS + CONVERGENCE_TIMEOUT)) output
+    while (( SECONDS < deadline )); do
+      if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json | python3 -c '
+import json,sys
+policy=json.load(sys.stdin)
+for rule in policy.get("spec", {}).get("rules", []):
+    for source in rule.get("from", []):
+        principals=source.get("source", {}).get("principals", [])
+        assert "poc.example/ns/zone-a/sa/zone-gateway" not in principals
+    for target in rule.get("to", []):
+        ports=target.get("operation", {}).get("ports", [])
+        assert "8443" not in ports
+' 2>/dev/null
+      then
+        output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-deleted-edge) || true
+        if is_forbidden_response "$output"; then break; fi
+      fi
+      sleep 0.25
+    done
+    [[ ${output:-} ]] && is_forbidden_response "$output" || return 1
+  else
+    wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-deleted-edge || return 1
+  fi
   assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || return 1
   assert_workloads_unchanged "$runtime_before"
 }
@@ -415,7 +454,7 @@ assert "x-destination-zone" not in h, h
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-spoof-deny \
     -H 'x-spiffe-peer-id: spiffe://poc.example/ns/zone-a/sa/zone-gateway' \
     -H 'x-destination-zone: zone-b') || true
-  is_denied_response "$output" || return 1
+  is_forbidden_response "$output" || return 1
   after=$(app_requests "$ZONE_B") || return 1
   [[ "$before" == "$after" ]] || return 1
   assert_workloads_unchanged "$runtime_before"
@@ -449,6 +488,7 @@ test_controller_outage_and_recovery() {
   # races policy propagation and mistakes that race for outage behavior.
   wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-before-controller-outage || return 1
   kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=0 >/dev/null || return 1
+  CONTROLLER_SCALED_DOWN=true
   kubectl -n "$CONTROL_NAMESPACE" wait --for=delete "pod" -l app.kubernetes.io/name="$CONTROLLER_DEPLOYMENT" --timeout=90s >/dev/null || return 1
   before=$(app_requests "$ZONE_B") || return 1
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-controller-outage) || true
@@ -468,6 +508,7 @@ test_controller_outage_and_recovery() {
   reverse_after=$(app_requests "$ZONE_A") || return 1
   [[ "$reverse_before" == "$reverse_after" ]] || return 1
   kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=1 >/dev/null || return 1
+  CONTROLLER_SCALED_DOWN=false
   kubectl -n "$CONTROL_NAMESPACE" rollout status "deployment/$CONTROLLER_DEPLOYMENT" --timeout=180s >/dev/null || return 1
   # The old dashboard port-forward targets the deleted Pod. Re-establish it
   # before inspecting API-backed state, then wait for a real data-plane allow;
@@ -615,10 +656,19 @@ assert all("spiffe" not in e.get("name", "").lower() for c in s["containers"] fo
     then
       return 1
     fi
-    if ! kubectl -n "$zone" get pod "$gateway_pod" -o json | python3 -c '
+    if ! kubectl -n "$zone" get pod "$gateway_pod" -o json | MODE="$MODE" python3 -c '
 import json,sys
 p=json.load(sys.stdin)
-assert any(v.get("csi",{}).get("driver") == "csi.spiffe.io" for v in p["spec"].get("volumes", [])), p["spec"].get("volumes")
+s=p["spec"]
+assert any(v.get("csi",{}).get("driver") == "csi.spiffe.io" for v in s.get("volumes", [])), s.get("volumes")
+if __import__("os").environ.get("MODE") == "istio":
+    # The custom gateway injection template intentionally replaces the
+    # application container with one Envoy gateway proxy.  Checking the live
+    # rendered Pod catches a silently skipped injection (which otherwise
+    # leaves an image:auto container and fails much later as an image pull).
+    containers=s.get("containers", [])
+    assert len(containers) == 1 and containers[0].get("name") == "istio-proxy", containers
+    assert any(m.get("mountPath") == "/run/secrets/workload-spiffe-uds" for m in containers[0].get("volumeMounts", [])), containers[0].get("volumeMounts")
 '
     then
       return 1
@@ -665,6 +715,11 @@ report_timings() {
 test_toggle_timings() {
   local n allowed timing start accepted applied observed output deadline runtime_before
   runtime_before=$(workload_fingerprint) || return 1
+  # Establish the opposite value outside the sample set. Each of the 20 loop
+  # mutations below then advances the ZoneTrust generation rather than timing a
+  # no-op server-side apply of the value left by an earlier test.
+  set_edge "$ZONE_A" "$ZONE_B" false >/dev/null || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-timing-initial-deny || return 1
   for ((n=1; n<=TOGGLE_SAMPLES; n++)); do
     if (( n % 2 )); then allowed=true; else allowed=false; fi
     timing=$(set_edge "$ZONE_A" "$ZONE_B" "$allowed") || return 1
@@ -673,7 +728,7 @@ test_toggle_timings() {
     while (( SECONDS < deadline )); do
       output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-timing) || true
       if [[ "$allowed" == true ]] && is_successful_response "$output"; then observed=$(now_ms); break; fi
-      if [[ "$allowed" == false ]] && is_denied_response "$output"; then observed=$(now_ms); break; fi
+      if [[ "$allowed" == false ]] && is_forbidden_response "$output"; then observed=$(now_ms); break; fi
       sleep 0.2
     done
     [[ -n ${observed:-} ]] || return 1

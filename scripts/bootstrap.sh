@@ -81,7 +81,7 @@ spire_rendered="$state_dir/spire-rendered.yaml"
 helm template spire spiffe/spire --namespace spire-system --version "$SPIRE_CHART_VERSION" \
   -f "$repo_root/config/spire/values.yaml" >"$spire_rendered"
 for required in '"default_svid_name": "default"' '"default_bundle_name": ""' '"default_all_bundles_name": "ROOTCA"' 'k8s_psat' 'ln -s spire-agent.sock socket'; do
-  rg -Fq "$required" "$spire_rendered" || { printf 'SPIRE chart render did not contain required setting: %s\n' "$required" >&2; exit 1; }
+  grep -Fq "$required" "$spire_rendered" || { printf 'SPIRE chart render did not contain required setting: %s\n' "$required" >&2; exit 1; }
 done
 # CRDs must exist before the umbrella chart, but the CRD chart must not own
 # spire-system: the umbrella chart creates and owns that namespace itself.

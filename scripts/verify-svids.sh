@@ -38,4 +38,5 @@ for zone in zone-a zone-b; do
     printf 'gateway in %s did not expose its expected SPIRE SVID through Envoy admin\n' "$zone" >&2
     exit 1
   }
+  printf 'VERIFIED SPIFFE SVID zone=%s uri=spiffe://poc.example/ns/%s/sa/zone-gateway\n' "$zone" "$zone"
 done
