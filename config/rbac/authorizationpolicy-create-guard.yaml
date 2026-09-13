@@ -1,0 +1,36 @@
+# CREATE cannot be constrained with RBAC resourceNames. This policy applies
+# only to the controller ServiceAccount's CREATE requests in zone namespaces;
+# mutation of an existing object is constrained by the Role's named
+# get/patch/update rule. failurePolicy: Fail ensures a CEL/configuration error
+# cannot silently widen the controller's create capability.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: zone-trust-controller-authorizationpolicy-create
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [security.istio.io]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [authorizationpolicies]
+        scope: Namespaced
+  matchConditions:
+    - name: controller-service-account
+      expression: request.userInfo.username == 'system:serviceaccount:control-plane:zone-trust-controller'
+  validations:
+    - expression: object.metadata.name == 'zone-trust-generated'
+      message: zone-trust-controller may only create zone-trust-generated AuthorizationPolicies
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: zone-trust-controller-authorizationpolicy-create
+spec:
+  policyName: zone-trust-controller-authorizationpolicy-create
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        security.poc.example/zone: "true"

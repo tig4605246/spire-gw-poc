@@ -25,8 +25,10 @@ var authorizationPolicyGVK = schema.GroupVersionKind{Group: "security.istio.io",
 // Istio's policy API represents a SPIFFE principal as trust-domain/ns/namespace/sa/serviceaccount.
 func Principal(sourceZone string) string { return "poc.example/ns/" + sourceZone + "/sa/zone-gateway" }
 
-// Render returns the one AuthorizationPolicy owned for destinationZone. It always
-// admits call-entry traffic on 8080 and otherwise admits only the supplied allowed edges.
+// Render returns the dynamic AuthorizationPolicy owned for destinationZone.
+// The independent bootstrap policy owns the public 8080 call entrypoint. This
+// policy therefore controls only protected 8443 cross-zone traffic: an empty
+// rules list is an explicit deny-all until an allowed incoming edge exists.
 func Render(destinationZone string, trusts []v1alpha1.ZoneTrust) (*unstructured.Unstructured, error) {
 	if err := v1alpha1.ValidateZone(destinationZone); err != nil {
 		return nil, err
@@ -41,9 +43,7 @@ func Render(destinationZone string, trusts []v1alpha1.ZoneTrust) (*unstructured.
 		}
 	}
 	sort.Slice(allowed, func(i, j int) bool { return allowed[i].Spec.SourceZone < allowed[j].Spec.SourceZone })
-	rules := []interface{}{
-		map[string]interface{}{"to": []interface{}{map[string]interface{}{"operation": map[string]interface{}{"ports": []interface{}{"8080"}}}}},
-	}
+	rules := make([]interface{}, 0, len(allowed))
 	for _, trust := range allowed {
 		rules = append(rules, map[string]interface{}{
 			"from": []interface{}{map[string]interface{}{"source": map[string]interface{}{"principals": []interface{}{Principal(trust.Spec.SourceZone)}}}},

@@ -66,4 +66,35 @@ for mode in ("standalone", "istio"):
             settings = rule["spec"]["trafficPolicy"]["portLevelSettings"]
             mtls = next(item for item in settings if item["port"]["number"] == 8443)
             assert mtls["connectionPool"]["http"]["maxRequestsPerConnection"] == 1, rule
+
+        # The bootstrap policy is deliberately separate from the dynamic
+        # controller policy. If the latter disappears, the remaining ALLOW
+        # policy still selects the gateway and matches only the public 8080
+        # entrypoint, so protected 8443 traffic remains denied.
+        policies = [o for o in objects if o["kind"] == "AuthorizationPolicy"]
+        assert {p["metadata"]["name"] for p in policies} == {"zone-trust-baseline"}, policies
+        for policy in policies:
+            assert policy["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "zone-trust-bootstrap"
+            assert policy["spec"]["rules"] == [{"to": [{"operation": {"ports": ["8080"]}}]}]
+
+        roles = [o for o in objects if o["kind"] == "Role" and o["metadata"]["name"] == "zone-trust-generated-policy"]
+        assert {r["metadata"]["namespace"] for r in roles} == {"zone-a", "zone-b"}
+        for role in roles:
+            named = next(rule for rule in role["rules"] if rule.get("resourceNames") == ["zone-trust-generated"])
+            assert set(named["verbs"]) == {"get", "patch", "update", "delete"}
+            create = next(rule for rule in role["rules"] if rule.get("verbs") == ["create"])
+            assert create["resources"] == ["authorizationpolicies"] and "resourceNames" not in create
+
+        vap = next(o for o in objects if o["kind"] == "ValidatingAdmissionPolicy" and o["metadata"]["name"] == "zone-trust-controller-authorizationpolicy-create")
+        assert vap["spec"]["failurePolicy"] == "Fail"
+        assert vap["spec"]["matchConstraints"]["resourceRules"] == [{
+            "apiGroups": ["security.istio.io"], "apiVersions": ["v1"], "operations": ["CREATE"],
+            "resources": ["authorizationpolicies"], "scope": "Namespaced",
+        }]
+        assert vap["spec"]["matchConditions"][0]["expression"] == "request.userInfo.username == 'system:serviceaccount:control-plane:zone-trust-controller'"
+        assert vap["spec"]["validations"][0]["expression"] == "object.metadata.name == 'zone-trust-generated'"
+        binding = next(o for o in objects if o["kind"] == "ValidatingAdmissionPolicyBinding" and o["metadata"]["name"] == vap["metadata"]["name"])
+        assert binding["spec"]["policyName"] == vap["metadata"]["name"]
+        assert binding["spec"]["validationActions"] == ["Deny"]
+        assert binding["spec"]["matchResources"]["namespaceSelector"]["matchLabels"] == {"security.poc.example/zone": "true"}
     print(f"PASS {mode}: YAML, overlays, plain apps, deny isolation, image tags, no key Secrets")

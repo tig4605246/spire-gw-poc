@@ -140,6 +140,10 @@ else
   kubectl apply -f "$repo_root/config/istio/default-authorization-policies.yaml"
 fi
 
+# Install the create-name admission guard before the Role grants CREATE. This
+# ordering matters on an in-place same-mode bootstrap: an already-running
+# controller must never observe the broader create grant without the guard.
+kubectl apply -f "$repo_root/config/rbac/authorizationpolicy-create-guard.yaml"
 kubectl apply -k "$repo_root/config/rbac"
 kubectl apply -k "$repo_root/config/controller"
 kubectl -n control-plane rollout status deployment/zone-trust-controller --timeout=5m

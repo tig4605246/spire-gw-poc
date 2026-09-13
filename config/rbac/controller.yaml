@@ -38,10 +38,12 @@ subjects:
     name: zone-trust-controller
     namespace: control-plane
 ---
-# Kubernetes RBAC cannot restrict a ClusterRole's writes by namespace. Keep
-# controller writes to the one controller-owned name in each destination zone.
-# Server-side apply uses PATCH and can create this named resource without a
-# collection-wide create grant.
+# Kubernetes RBAC does not apply resourceNames to CREATE. The named rule below
+# limits existing-object mutation; the separate namespace-scoped CREATE grant
+# lets server-side apply recreate the dynamic policy after accidental deletion.
+# The guard installed from authorizationpolicy-create-guard.yaml before this
+# Role is granted limits CREATE to zone-trust-generated, so the controller
+# cannot create a second policy that weakens the bootstrap-owned 8080 baseline.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -52,6 +54,9 @@ rules:
     resources: [authorizationpolicies]
     resourceNames: [zone-trust-generated]
     verbs: [get, patch, update, delete]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -77,6 +82,9 @@ rules:
     resources: [authorizationpolicies]
     resourceNames: [zone-trust-generated]
     verbs: [get, patch, update, delete]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

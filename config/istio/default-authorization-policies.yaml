@@ -1,13 +1,15 @@
-# Applied before the controller becomes ready. These policies select the
-# gateways and allow only the public call entrypoint, making port 8443 deny-all
-# until a controller-owned reconciliation materializes incoming trust edges.
+# Applied before any gateway is created. These bootstrap-owned policies retain
+# the public call entrypoint independently from the controller-managed 8443
+# policy. Consequently, deletion or reconciliation failure of the dynamic
+# policy leaves an ALLOW policy selecting the gateway whose only match is 8080;
+# Istio therefore continues to deny protected 8443 traffic.
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
-  name: zone-trust-generated
+  name: zone-trust-baseline
   namespace: zone-a
   labels:
-    app.kubernetes.io/managed-by: zone-trust-controller
+    app.kubernetes.io/managed-by: zone-trust-bootstrap
     security.poc.example/destination-zone: zone-a
 spec:
   selector:
@@ -23,10 +25,10 @@ spec:
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
-  name: zone-trust-generated
+  name: zone-trust-baseline
   namespace: zone-b
   labels:
-    app.kubernetes.io/managed-by: zone-trust-controller
+    app.kubernetes.io/managed-by: zone-trust-bootstrap
     security.poc.example/destination-zone: zone-b
 spec:
   selector:

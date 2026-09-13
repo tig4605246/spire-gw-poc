@@ -420,6 +420,231 @@ assert_workloads_unchanged() {
   [[ "$before" == "$after" ]] || fail "a policy toggle changed app/gateway Pod UID or restart count"
 }
 
+assert_istio_baseline() {
+  kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-baseline -o json | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+assert p.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by") == "zone-trust-bootstrap", p
+assert p.get("spec", {}).get("rules") == [{"to": [{"operation": {"ports": ["8080"]}}]}], p.get("spec")
+'
+}
+
+wait_dynamic_policy_empty() {
+  local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json 2>/dev/null | python3 -c '
+import json,sys
+assert json.load(sys.stdin).get("spec", {}).get("rules") == []
+' 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+wait_dynamic_policy_allows_a_to_b() {
+  local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json 2>/dev/null | python3 -c '
+import json,sys
+rules=json.load(sys.stdin).get("spec", {}).get("rules", [])
+assert all("8080" not in target.get("operation", {}).get("ports", []) for rule in rules for target in rule.get("to", []))
+assert any(
+    "poc.example/ns/zone-a/sa/zone-gateway" in source.get("source", {}).get("principals", [])
+    and "8443" in target.get("operation", {}).get("ports", [])
+    for rule in rules for source in rule.get("from", []) for target in rule.get("to", [])
+)
+' 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+wait_istio_active_listener_without_dynamic_policy() {
+  local pod deadline=$((SECONDS + CONVERGENCE_TIMEOUT)) dump
+  pod=$(kubectl -n "$ZONE_B" get pod -l app.kubernetes.io/component=zone-gateway,security.poc.example/zone="$ZONE_B",spiffe.io/spire-managed-identity=true -o jsonpath='{.items[0].metadata.name}') || return 1
+  [[ -n "$pod" ]] || return 1
+  # proxy-config reads Envoy's active listener configuration; unlike a traffic
+  # retry it cannot reach the destination application while xDS is converging.
+  # Do not interpret the API deletion itself as immediate proxy revocation.
+  while (( SECONDS < deadline )); do
+    dump=$("$ISTIOCTL" proxy-config listeners "$pod" -n "$ZONE_B" --port 8443 --output json 2>/dev/null) || dump=
+    if printf '%s' "$dump" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+encoded=json.dumps(d, sort_keys=True)
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for item in value.values(): yield from walk(item)
+    elif isinstance(value, list):
+        for item in value: yield from walk(item)
+listeners=list(walk(d))
+assert any(str(x.get("name", "")).endswith("_8443") for x in listeners), d
+assert "zone-trust-generated" not in encoded, encoded
+' 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+pause_controller() {
+  kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=0 >/dev/null || return 1
+  CONTROLLER_SCALED_DOWN=true
+  if ! kubectl -n "$CONTROL_NAMESPACE" wait --for=delete "pod" -l app.kubernetes.io/name="$CONTROLLER_DEPLOYMENT" --timeout=90s >/dev/null; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+}
+
+test_istio_create_guard() {
+  [[ "$MODE" == istio ]] || return 0
+  local as_controller="system:serviceaccount:$CONTROL_NAMESPACE:zone-trust-controller" rejection
+  # Use POST (rather than apply's PATCH) to exercise the recovery CREATE
+  # permission directly. RBAC deliberately grants this verb, so a successful
+  # negative test must be rejected by the ValidatingAdmissionPolicy itself.
+  if rejection=$(kubectl --as="$as_controller" -n "$ZONE_B" create -f - 2>&1 <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-illegal-e2e
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      security.poc.example/zone: zone-b
+  action: ALLOW
+  rules: []
+EOF
+); then
+    fail "admission guard allowed controller ServiceAccount to create a second AuthorizationPolicy"
+    return 1
+  fi
+  if [[ "$rejection" != *"ValidatingAdmissionPolicy"* || "$rejection" != *"zone-trust-controller-authorizationpolicy-create"* ]]; then
+    log "    expected ValidatingAdmissionPolicy rejection, got: $rejection"
+    return 1
+  fi
+  kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-illegal-e2e >/dev/null 2>&1 && return 1
+
+  # Retain the SSA form as a separate check: it must not bypass the name guard
+  # through an apply request. The named PATCH permission is absent for this
+  # object, so this is defense in depth rather than the VAP proof above.
+  if kubectl --as="$as_controller" -n "$ZONE_B" apply --server-side --force-conflicts \
+    --field-manager=zone-trust-controller -f - >/dev/null <<'EOF'; then
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-illegal-e2e
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      security.poc.example/zone: zone-b
+  action: ALLOW
+  rules: []
+EOF
+    fail "controller ServiceAccount server-side applied a second AuthorizationPolicy"
+    return 1
+  fi
+
+  # Existing-object mutation must remain constrained by RBAC resourceNames;
+  # use server-side apply so this covers the same PATCH path as the controller.
+  if kubectl --as="$as_controller" -n "$ZONE_B" apply --server-side --force-conflicts \
+    --field-manager=zone-trust-controller -f - >/dev/null <<'EOF'; then
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-baseline
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      security.poc.example/zone: zone-b
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8443"]
+EOF
+    fail "controller ServiceAccount mutated the bootstrap AuthorizationPolicy"
+    return 1
+  fi
+  assert_istio_baseline
+}
+
+test_istio_dynamic_policy_recreation_fail_closed() {
+  [[ "$MODE" == istio ]] || return 0
+  local runtime_before before after
+  runtime_before=$(workload_fingerprint) || return 1
+
+  # First delete the dynamic policy while an allowed edge is known to be live.
+  # In the former one-policy design this removed the sole 8080 ALLOW policy,
+  # leaving no AuthorizationPolicy that selected the gateway and fail-opening
+  # protected 8443. The bootstrap policy must retain a stable exact 403 until
+  # the controller can recreate the dynamic object.
+  set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
+  wait_dynamic_policy_allows_a_to_b || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-dynamic-predelete-allow || return 1
+  before=$(app_requests "$ZONE_B") || return 1
+  pause_controller || return 1
+  if ! kubectl -n "$ZONE_B" delete authorizationpolicy zone-trust-generated --wait=true >/dev/null; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  if ! assert_istio_baseline || ! wait_istio_active_listener_without_dynamic_policy; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  # The first post-delete request is intentionally only after proxy evidence
+  # says the active 8443 RBAC listener no longer has the dynamic policy.
+  assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || { restore_controller_after_outage || true; return 1; }
+  after=$(app_requests "$ZONE_B") || { restore_controller_after_outage || true; return 1; }
+  [[ "$before" == "$after" ]] || { restore_controller_after_outage || true; return 1; }
+
+  # The actual controller SSA recreation proves both the CREATE grant and the
+  # admission guard permit the one exact dynamic name. The allowed route may
+  # return only after that policy is observed again.
+  restore_controller_after_outage || return 1
+  ensure_controller_port_forward || return 1
+  wait_dynamic_policy_allows_a_to_b || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-dynamic-recreated-allow || return 1
+
+  # Repeat from a denied edge. Keep one app counter baseline across both the
+  # missing-policy period and the repaired empty-rules policy, proving every
+  # probe stayed a 403 through the whole fail-closed transition.
+  set_edge "$ZONE_A" "$ZONE_B" false >/dev/null || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-dynamic-denied-predelete || return 1
+  before=$(app_requests "$ZONE_B") || return 1
+  pause_controller || return 1
+  if ! kubectl -n "$ZONE_B" delete authorizationpolicy zone-trust-generated --wait=true >/dev/null; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  if ! assert_istio_baseline || ! wait_istio_active_listener_without_dynamic_policy; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || { restore_controller_after_outage || true; return 1; }
+  restore_controller_after_outage || return 1
+  ensure_controller_port_forward || return 1
+  if ! wait_dynamic_policy_empty || ! wait_istio_active_listener_without_dynamic_policy; then
+    return 1
+  fi
+  assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || return 1
+  after=$(app_requests "$ZONE_B") || return 1
+  [[ "$before" == "$after" ]] || return 1
+
+  set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
+  wait_dynamic_policy_allows_a_to_b || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-dynamic-final-allow || return 1
+  assert_workloads_unchanged "$runtime_before"
+}
+
 test_default_deny() {
   # A new bootstrap starts with no edge at all. An existing edge here means the
   # cluster was not fresh (or bootstrap violated its deny-all contract), so do
@@ -804,8 +1029,10 @@ if __import__("os").environ.get("MODE") == "istio":
     gateway_admin_contains "$ZONE_B" 'ext_authz' || return 1
   else
     for zone in "$ZONE_A" "$ZONE_B"; do
+      kubectl -n "$zone" get authorizationpolicy zone-trust-baseline >/dev/null || return 1
       kubectl -n "$zone" get authorizationpolicy zone-trust-generated >/dev/null || return 1
     done
+    assert_istio_baseline || return 1
     gateway_admin_contains "$ZONE_B" 'envoy.filters.http.rbac' || return 1
     assert_istio_proxy_sync || return 1
   fi
@@ -869,6 +1096,10 @@ main() {
   run_case 'default deny keeps destination counter unchanged' test_default_deny
   run_case 'allow A -> B reaches destination app' test_allow
   run_case 'structural invariants' test_structure
+  if [[ "$MODE" == istio ]]; then
+    run_case 'Istio policy create guard blocks baseline weakening' test_istio_create_guard
+    run_case 'Istio dynamic policy deletion fails closed and controller recreates it' test_istio_dynamic_policy_recreation_fail_closed
+  fi
   run_case 'deleting A -> B returns immediately to deny' test_deleted_edge_deny
   run_case 'directional trust permits A -> B but denies B -> A' test_directional
   run_case 'live deny and restore allow without workload restart' test_live_toggle
