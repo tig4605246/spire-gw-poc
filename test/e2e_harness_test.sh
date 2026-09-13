@@ -85,3 +85,37 @@ run_scenario clean pass
 run_scenario leaked-header fail
 run_scenario counter-change fail
 printf 'e2e spoof convergence helper regression tests passed\n'
+
+# shellcheck disable=SC1090 # Load only the two active-listener helpers.
+source <(awk '
+  /^wait_istio_active_listener_without_dynamic_policy\(\)/ { emit=1 }
+  /^pause_controller\(\)/ { exit }
+  emit { print }
+' "$ROOT/scripts/e2e.sh")
+# shellcheck disable=SC2034 # Consumed by the sourced production helpers.
+ZONE_B=zone-b
+# shellcheck disable=SC2034 # Consumed by the sourced production helpers.
+ISTIOCTL=mock_istioctl
+kubectl() { printf 'gateway-pod\n'; }
+mock_istioctl() { printf '%s\n' "$MOCK_LISTENER"; }
+
+MOCK_LISTENER='[{"name":"0.0.0.0_8443","policies":{}}]'
+wait_istio_active_listener_without_dynamic_policy
+if wait_istio_active_listener_with_dynamic_deny_all; then
+  printf 'missing policy was mistaken for a recreated deny-all policy\n' >&2
+  exit 1
+fi
+
+MOCK_LISTENER='[{"name":"0.0.0.0_8443","policies":{"ns[zone-b]-policy[zone-trust-generated]-rule[0]":{"permissions":[{"notRule":{"any":true}}],"principals":[{"notId":{"any":true}}]}}}]'
+wait_istio_active_listener_with_dynamic_deny_all
+if wait_istio_active_listener_without_dynamic_policy; then
+  printf 'recreated deny-all policy was mistaken for a missing policy\n' >&2
+  exit 1
+fi
+
+MOCK_LISTENER='[{"name":"0.0.0.0_8443","policies":{"ns[zone-b]-policy[zone-trust-generated]-rule[0]":{"permissions":[{"any":true}],"principals":[{"any":true}]}}}]'
+if wait_istio_active_listener_with_dynamic_deny_all; then
+  printf 'permissive generated policy was mistaken for deny-all\n' >&2
+  exit 1
+fi
+printf 'e2e missing versus recreated deny-all listener regression tests passed\n'

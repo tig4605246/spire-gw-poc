@@ -493,6 +493,40 @@ assert "zone-trust-generated" not in encoded, encoded
   return 1
 }
 
+wait_istio_active_listener_with_dynamic_deny_all() {
+  local pod deadline=$((SECONDS + CONVERGENCE_TIMEOUT)) dump
+  pod=$(kubectl -n "$ZONE_B" get pod -l app.kubernetes.io/component=zone-gateway,security.poc.example/zone="$ZONE_B",spiffe.io/spire-managed-identity=true -o jsonpath='{.items[0].metadata.name}') || return 1
+  [[ -n "$pod" ]] || return 1
+  # Istio represents an ALLOW policy with rules: [] as one explicit RBAC
+  # deny-all rule (notRule/notId any). This confirms xDS has observed the
+  # recreated policy before the following exact-403 counter probe.
+  while (( SECONDS < deadline )); do
+    dump=$("$ISTIOCTL" proxy-config listeners "$pod" -n "$ZONE_B" --port 8443 --output json 2>/dev/null) || dump=
+    if printf '%s' "$dump" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+def walk(value):
+    if isinstance(value, dict):
+        yield value
+        for item in value.values(): yield from walk(item)
+    elif isinstance(value, list):
+        for item in value: yield from walk(item)
+listeners=list(walk(d))
+assert any(str(x.get("name", "")).endswith("_8443") for x in listeners), d
+policies=[]
+for item in listeners:
+    policies.extend(item.get("policies", {}).items())
+name, policy=next((pair for pair in policies if "zone-trust-generated" in pair[0]))
+assert policy.get("permissions") == [{"notRule": {"any": True}}], (name, policy)
+assert policy.get("principals") == [{"notId": {"any": True}}], (name, policy)
+' 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 pause_controller() {
   kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=0 >/dev/null || return 1
   CONTROLLER_SCALED_DOWN=true
@@ -632,7 +666,7 @@ test_istio_dynamic_policy_recreation_fail_closed() {
   assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || { restore_controller_after_outage || true; return 1; }
   restore_controller_after_outage || return 1
   ensure_controller_port_forward || return 1
-  if ! wait_dynamic_policy_empty || ! wait_istio_active_listener_without_dynamic_policy; then
+  if ! wait_dynamic_policy_empty || ! wait_istio_active_listener_with_dynamic_deny_all; then
     return 1
   fi
   assert_counter_unchanged_after_denied_call "$ZONE_A" "$ZONE_B" || return 1
