@@ -23,9 +23,24 @@ flock -n 9 || { printf 'bootstrap for %s is already running\n' "$mode" >&2; exit
 # the mode-scoped file, which also makes standalone and Istio clusters coexist.
 export KUBECONFIG="$state_dir/kubeconfig"
 cluster_name="spire-gw-$mode"
+expected_context="kind-$cluster_name"
 
 require() { command -v "$1" >/dev/null || { printf 'missing required command: %s\n' "$1" >&2; exit 1; }; }
 require docker; require kubectl; require kind; require helm; require curl
+
+# Do not rewrite an unrelated context, even when the caller explicitly exports
+# KUBECONFIG. Validate before creating a cluster or exporting either file.
+if [[ -n "$requested_kubeconfig" && "$requested_kubeconfig" != "$KUBECONFIG" ]]; then
+  if [[ "$requested_kubeconfig" == *:* ]]; then
+    printf 'KUBECONFIG must name one mode-specific file, not a path list\n' >&2
+    exit 1
+  fi
+  if [[ -e "$requested_kubeconfig" ]] &&
+     [[ "$(kubectl --kubeconfig "$requested_kubeconfig" config current-context 2>/dev/null || true)" != "$expected_context" ]]; then
+    printf 'refusing to overwrite KUBECONFIG with an unrelated current context; use a new file or unset KUBECONFIG\n' >&2
+    exit 1
+  fi
+fi
 
 kind_config="$state_dir/kind.yaml"
 cat >"$kind_config" <<EOF
@@ -48,7 +63,6 @@ if ! kind get clusters | grep -Fxq "$cluster_name"; then
 else
   kind export kubeconfig --name "$cluster_name" --kubeconfig "$KUBECONFIG"
 fi
-expected_context="kind-$cluster_name"
 [[ "$(kubectl config current-context)" == "$expected_context" ]] || {
   printf 'refusing to mutate unexpected Kubernetes context (wanted %s)\n' "$expected_context" >&2
   exit 1

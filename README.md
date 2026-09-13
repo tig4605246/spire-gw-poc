@@ -37,7 +37,7 @@ make e2e MODE=istio
 make dashboard MODE=istio
 ```
 
-Each mode uses its own three-node cluster, named `spire-gw-standalone` or `spire-gw-istio`. Kubeconfigs live under `.state/<mode>/kubeconfig`. Commands do not change your default kubectl context. `KUBECONFIG` overrides the mode's kubeconfig when explicitly set.
+Each mode uses its own three-node cluster, named `spire-gw-standalone` or `spire-gw-istio`. Kubeconfigs live under `.state/<mode>/kubeconfig`. Commands do not change your default kubectl context. `KUBECONFIG` overrides the mode's kubeconfig when explicitly set. Bootstrap rejects an existing override with an unrelated current context. Use a new file or unset `KUBECONFIG`.
 
 Allow several minutes for the first bootstrap to download images. Each cluster runs SPIRE Server, three Agents, CSI, Cilium, two apps, two gateways, and the controller. Istio mode also runs Istiod. See [test evidence](docs/test-evidence.md) for the tested host and measured results.
 
