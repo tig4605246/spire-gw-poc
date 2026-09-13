@@ -14,6 +14,7 @@ test:
 	go vet ./...
 	go test -race ./...
 	bash ./test/e2e_harness_test.sh
+	bash ./test/verify_svid_chain_test.sh
 	./scripts/check.sh
 build:
 	source versions.env; docker build --build-arg GO_VERSION=$$GO_VERSION --build-arg BASE_IMAGE=$$DISTROLESS_IMAGE --build-arg COMMAND=zone-trust-controller -t spire-gw-controller:dev .
