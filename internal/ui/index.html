@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Zone trust · SPIRE gateway POC</title>
+  <style>
+    :root{color-scheme:dark;font:15px/1.5 system-ui,sans-serif;background:#10171f;color:#e9f1f7}
+    *{box-sizing:border-box}body{max-width:1100px;margin:auto;padding:48px 24px}header{display:flex;justify-content:space-between;gap:20px;align-items:center}h1{font-size:32px;letter-spacing:-1px;margin:0}p{color:#a9bdcc}small{color:#91a6b6}.badge{padding:7px 12px;border:1px solid #425361;border-radius:20px;font-size:12px}.connected{color:#76e2b0}.offline{color:#ff9d9d}section{background:#18232e;border:1px solid #304252;border-radius:16px;padding:24px;margin:28px 0;overflow:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:18px;border-bottom:1px solid #304252}th{color:#a9bdcc;font-weight:500}button{font:inherit;cursor:pointer;border:1px solid #506271;border-radius:9px;padding:10px 16px;color:#d6e1e9;background:#223240}button:hover{border-color:#cadce9}button:disabled{cursor:wait;opacity:.65}.allow{background:#154b3d;border-color:#398e73;color:#b2ffdf}.pending{background:#594a23;border-color:#a8914a;color:#ffde87}.error{background:#582d32;color:#ffc1c5}td small{display:block;margin-top:8px;font-size:11px}.diagonal{color:#526775}code{font-size:12px;color:#b3d6ed;overflow-wrap:anywhere}.legend{display:flex;gap:22px;flex-wrap:wrap;font-size:12px}#error{color:#ffb2b2;white-space:pre-wrap}#details{min-height:100px}h2{font-size:17px;margin-top:0}footer{font-size:12px;color:#839aaa}@media(max-width:600px){body{padding:24px 12px}header{display:block}.badge{display:inline-block;margin-top:16px}section{padding:14px}th,td{padding:12px}}
+  </style>
+</head>
+<body>
+  <header><div><small>SPIRE / GATEWAY LAB</small><h1>Directional zone trust</h1></div><span id="connection" class="badge">Connecting…</span></header>
+  <p>Choose which authenticated source gateway can enter each destination zone. Each change writes a Kubernetes <code>ZoneTrust</code>.</p>
+  <section><div class="legend"><span>🟢 Allowed and applied</span><span>○ Denied</span><span>◷ Pending generation</span></div><div id="matrix" aria-live="polite">Loading zones…</div></section>
+  <p id="error" role="alert"></p>
+  <section id="details"><h2>Policy details</h2><p>Select an edge to change its desired state. Application status appears after the controller observes the generation.</p></section>
+  <footer>Source → destination · No self edges · Missing edges deny · Local demonstration, one SPIFFE trust domain</footer>
+  <script>
+    const $ = id => document.getElementById(id);
+    let zones = [], trusts = [], online = false;
+    const inFlight = new Set();
+    const text = (tag, value) => { const n = document.createElement(tag); n.textContent = value; return n; };
+    const zoneName = z => typeof z === 'string' ? z : z.name;
+    const normalize = t => t.spec ? t : ({metadata:{generation:t.generation},spec:{sourceZone:t.sourceZone,destinationZone:t.destinationZone,allowed:t.allowed},status:t});
+    const edgeKey = (a,b) => `${a}/${b}`;
+    async function json(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) throw new Error(`Request failed (${response.status}): ${await response.text()}`);
+      return response.json();
+    }
+    function connection(ok) { online = ok; $('connection').textContent = ok ? '● Controller connected' : '● Controller unreachable'; $('connection').className = `badge ${ok ? 'connected' : 'offline'}`; }
+    function details(a,b,t) {
+      const box = $('details'); box.replaceChildren(text('h2', `${a} → ${b}`));
+      box.append(text('code', `spiffe://poc.example/ns/${a}/sa/zone-gateway`));
+      box.append(text('p', `Backend: ${t?.status?.backend || 'Awaiting controller'} · Desired generation: ${t?.metadata?.generation || 'absent'} · Applied generation: ${t?.status?.observedGeneration || 0}`));
+      box.append(text('small', `Last transition: ${t?.status?.lastTransitionTime || '—'} · ${t?.status?.message || 'Missing edge: deny'}`));
+    }
+    function render() {
+      const table = document.createElement('table'), head = document.createElement('tr');
+      head.append(text('th', 'From ↓ / To →')); zones.forEach(z => head.append(text('th', zoneName(z)))); table.append(head);
+      zones.forEach(source => {
+        const a = zoneName(source), row = document.createElement('tr'); row.append(text('th', a));
+        zones.forEach(destination => {
+          const b = zoneName(destination), cell = document.createElement('td'); row.append(cell);
+          if (a === b) { cell.append(text('span', '—')); cell.className = 'diagonal'; return; }
+          const t = trusts.find(t => t.spec.sourceZone === a && t.spec.destinationZone === b);
+          const applied = !t || (t.status?.applied && t.status.observedGeneration === t.metadata.generation);
+          const failed = t?.status?.applied === false && t?.status?.observedGeneration === t?.metadata?.generation;
+          const busy = inFlight.has(edgeKey(a,b)), pending = busy || !applied;
+          const button = text('button', busy ? 'Saving…' : failed ? 'Reconcile error' : pending ? 'Pending…' : t?.spec.allowed ? 'Allowed ✓' : 'Denied');
+          button.className = failed ? 'error' : pending ? 'pending' : t?.spec.allowed ? 'allow' : '';
+          button.disabled = busy || !online; button.setAttribute('aria-label', `${a} to ${b}: ${button.textContent}. Toggle trust.`);
+          button.onclick = () => toggle(a,b,t); button.onfocus = () => details(a,b,t);
+          cell.append(button, text('small', t ? `desired ${t.metadata.generation} / applied ${t.status?.observedGeneration || 0}` : 'No edge · deny'));
+        }); table.append(row);
+      }); $('matrix').replaceChildren(table);
+    }
+    async function refresh() {
+      try {
+        const [z,t] = await Promise.all([json('/api/v1/zones'), json('/api/v1/trusts')]);
+        zones = z.items || z.zones || []; trusts = (t.items || t.trusts || []).map(normalize);
+        connection(true); render();
+      } catch (error) { connection(false); $('error').textContent = error.message; render(); }
+    }
+    async function toggle(a,b,t) {
+      const key = edgeKey(a,b); inFlight.add(key); $('error').textContent = ''; render(); details(a,b,t);
+      try {
+        const result = await json(`/api/v1/trusts/${encodeURIComponent(a)}/${encodeURIComponent(b)}`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({allowed:!t?.spec.allowed})});
+        details(a,b,normalize(result.trust || result)); await refresh();
+      } catch (error) { $('error').textContent = error.message; }
+      finally { inFlight.delete(key); render(); }
+    }
+    const events = new EventSource('/api/v1/events');
+    events.onmessage = () => refresh(); events.addEventListener('trusts', refresh); events.addEventListener('policy', refresh);
+    events.onopen = () => refresh(); events.onerror = () => { connection(false); render(); };
+    refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
