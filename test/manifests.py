@@ -59,4 +59,11 @@ for mode in ("standalone", "istio"):
             elif container["name"] == "controller":
                 assert container["image"] == PINS["CONTROLLER_IMAGE"], "Controller pin drift"
     assert not any(o["kind"] == "Secret" for o in objects), "Gateway manifests must not carry keys"
+    if mode == "istio":
+        rules = [o for o in objects if o["kind"] == "DestinationRule"]
+        assert {o["metadata"]["name"] for o in rules} == {"zone-a-gateway-mtls", "zone-b-gateway-mtls"}
+        for rule in rules:
+            settings = rule["spec"]["trafficPolicy"]["portLevelSettings"]
+            mtls = next(item for item in settings if item["port"]["number"] == 8443)
+            assert mtls["connectionPool"]["http"]["maxRequestsPerConnection"] == 1, rule
     print(f"PASS {mode}: YAML, overlays, plain apps, deny isolation, image tags, no key Secrets")

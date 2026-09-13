@@ -117,6 +117,8 @@ This is one kind cluster per mode and one SPIFFE trust domain. It does not demon
 
 Dashboard authentication is omitted for local use. Its Service is accessible through localhost port-forward. Only gateway Pods can reach the separate authorization Service through the declared NetworkPolicy.
 
+Istio uses one request per inter-gateway connection on port 8443. This avoids the inconsistent decisions observed with reused connections during rapid policy changes. It adds connection and TLS setup costs; see [the connection-lifetime decision](docs/adr/0004-bound-istio-gateway-connections.md).
+
 The 120-second SVID lifetime supports a short functional rotation test. It is not a production rotation benchmark. Convergence measurements include the test harness and Kubernetes command overhead.
 
 ## Cleanup

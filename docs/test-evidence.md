@@ -57,6 +57,8 @@ At one inspection point, Docker reported about 1.26 GiB for the control-plane no
 
 On 2026-09-13, `make destroy MODE=istio`, `make bootstrap MODE=istio`, and `make e2e MODE=istio` completed successfully. The suite passed all 12 cases, with zero failures and no skipped cases. Local artifacts are in `.state/istio/evidence/20260913T121115-632742/`.
 
+These initial measurements precede the connection-reuse change in ADR 0004. The final CI artifacts contain results for the updated configuration.
+
 The same functional matrix passed with controller-generated Istio authorization. During controller outage, A→B remained allowed and B→A remained denied. The generated policy was visible in Kubernetes and enforced by the destination proxy.
 
 Both proxies reported `SYNCED` for CDS, EDS, LDS, and RDS. The live Pod checks found exactly one regular `istio-proxy` container per gateway, with the SPIRE CSI socket mount. Apps remained plain HTTP workloads with one container.
@@ -90,6 +92,8 @@ The [workflow](../.github/workflows/ci.yaml) runs unit, race, generation, manife
 The first runner check job passed. Its bootstrap jobs exposed a missing `rg` utility on the runner. The bootstrap now uses standard `grep` for that fixed-string assertion.
 
 Later runners exposed an Istio test race after policy changes. A focused local reproduction observed transient 403 responses after an initial successful allow probe. Every successful spoof response had the protected headers removed. The harness now separates traffic convergence from its strict header, denial, and app-counter assertions. Final runner status is available in the linked Actions history.
+
+An independent runner also exposed intermittent Istio denials during controller outage. The local reproduction kept the same AuthorizationPolicy resource version and correct peer SPIFFE identity. Disabling source-gateway connection reuse produced eight successful requests out of eight. Restoring reuse produced three denials out of eight. Both inter-gateway DestinationRules now limit each connection to one request. The outage test checks eight requests, not one. [ADR 0004](adr/0004-bound-istio-gateway-connections.md) records the evidence and performance trade-off.
 
 ## Interpretation and limitations
 

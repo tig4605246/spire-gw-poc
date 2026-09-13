@@ -546,8 +546,17 @@ test_direct_app_bypass() {
   [[ "$before" == "$after" ]] || fail "NetworkPolicy did not prevent direct app access ($before -> $after)"
 }
 
+restore_controller_after_outage() {
+  # run_case intentionally continues after an individual failure, so an outage
+  # assertion must restore the control plane before returning. The EXIT trap is
+  # retained as a last-resort retry if restoration itself fails.
+  kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=1 >/dev/null || return 1
+  CONTROLLER_SCALED_DOWN=false
+  kubectl -n "$CONTROL_NAMESPACE" rollout status "deployment/$CONTROLLER_DEPLOYMENT" --timeout=180s >/dev/null
+}
+
 test_controller_outage_and_recovery() {
-  local before output after reverse_before reverse_output reverse_after
+  local before output after reverse_before reverse_output reverse_after n
   set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
   set_edge "$ZONE_B" "$ZONE_A" false >/dev/null || return 1
   # Status is an API-policy observation. Give Istiod/xDS time to program the
@@ -556,27 +565,60 @@ test_controller_outage_and_recovery() {
   wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-before-controller-outage || return 1
   kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=0 >/dev/null || return 1
   CONTROLLER_SCALED_DOWN=true
-  kubectl -n "$CONTROL_NAMESPACE" wait --for=delete "pod" -l app.kubernetes.io/name="$CONTROLLER_DEPLOYMENT" --timeout=90s >/dev/null || return 1
-  before=$(app_requests "$ZONE_B") || return 1
-  output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-controller-outage) || true
+  if ! kubectl -n "$CONTROL_NAMESPACE" wait --for=delete "pod" -l app.kubernetes.io/name="$CONTROLLER_DEPLOYMENT" --timeout=90s >/dev/null; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  if ! before=$(app_requests "$ZONE_B"); then
+    restore_controller_after_outage || true
+    return 1
+  fi
   if [[ "$MODE" == standalone ]]; then
-    is_denied_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
-    after=$(app_requests "$ZONE_B") || return 1
-    [[ "$before" == "$after" ]] || return 1
+    output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-controller-outage) || true
+    is_denied_response "$output" || { response_summary "$output" >&2; restore_controller_after_outage || true; return 1; }
+    if ! after=$(app_requests "$ZONE_B"); then
+      restore_controller_after_outage || true
+      return 1
+    fi
+    if [[ "$before" != "$after" ]]; then
+      restore_controller_after_outage || true
+      return 1
+    fi
   else
-    is_successful_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
+    # Each request uses a fresh upstream mTLS connection (enforced by the
+    # DestinationRule) and must retain the last accepted Istio policy while
+    # the controller is unavailable. One success is not sufficient evidence.
+    for ((n=1; n<=8; n++)); do
+      output=$(gateway_call "$ZONE_A" "$ZONE_B" "/e2e-controller-outage-$n") || true
+      if ! is_successful_response "$output"; then
+        response_summary "$output" >&2
+        restore_controller_after_outage || true
+        return 1
+      fi
+    done
   fi
   # Istio retains the last accepted policy when its controller is down. Prove
   # that this is the specific directional state, not an accidental all-open
   # policy: B -> A remains denied and never reaches A's app.
-  reverse_before=$(app_requests "$ZONE_A") || return 1
+  if ! reverse_before=$(app_requests "$ZONE_A"); then
+    restore_controller_after_outage || true
+    return 1
+  fi
   reverse_output=$(gateway_call "$ZONE_B" "$ZONE_A" /e2e-controller-outage-reverse) || true
-  is_denied_response "$reverse_output" || { printf '%s\n' "$reverse_output" >&2; return 1; }
-  reverse_after=$(app_requests "$ZONE_A") || return 1
-  [[ "$reverse_before" == "$reverse_after" ]] || return 1
-  kubectl -n "$CONTROL_NAMESPACE" scale "deployment/$CONTROLLER_DEPLOYMENT" --replicas=1 >/dev/null || return 1
-  CONTROLLER_SCALED_DOWN=false
-  kubectl -n "$CONTROL_NAMESPACE" rollout status "deployment/$CONTROLLER_DEPLOYMENT" --timeout=180s >/dev/null || return 1
+  if [[ "$MODE" == istio ]]; then
+    is_forbidden_response "$reverse_output" || { response_summary "$reverse_output" >&2; restore_controller_after_outage || true; return 1; }
+  else
+    is_denied_response "$reverse_output" || { response_summary "$reverse_output" >&2; restore_controller_after_outage || true; return 1; }
+  fi
+  if ! reverse_after=$(app_requests "$ZONE_A"); then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  if [[ "$reverse_before" != "$reverse_after" ]]; then
+    restore_controller_after_outage || true
+    return 1
+  fi
+  restore_controller_after_outage || return 1
   # The old dashboard port-forward targets the deleted Pod. Re-establish it
   # before inspecting API-backed state, then wait for a real data-plane allow;
   # a previously equal ZoneTrust status alone does not prove the new standalone
