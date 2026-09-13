@@ -17,7 +17,7 @@
   <footer>Source → destination · No self edges · Missing edges deny · Local demonstration, one SPIFFE trust domain</footer>
   <script>
     const $ = id => document.getElementById(id);
-    let zones = [], trusts = [], online = false;
+    let zones = [], trusts = [], online = false, selected = null;
     const inFlight = new Set();
     const text = (tag, value) => { const n = document.createElement(tag); n.textContent = value; return n; };
     const zoneName = z => typeof z === 'string' ? z : z.name;
@@ -30,6 +30,7 @@
     }
     function connection(ok) { online = ok; $('connection').textContent = ok ? '● Controller connected' : '● Controller unreachable'; $('connection').className = `badge ${ok ? 'connected' : 'offline'}`; }
     function details(a,b,t) {
+      selected = [a,b];
       const box = $('details'); box.replaceChildren(text('h2', `${a} → ${b}`));
       box.append(text('code', `spiffe://poc.example/ns/${a}/sa/zone-gateway`));
       box.append(text('p', `Backend: ${t?.status?.backend || 'Awaiting controller'} · Desired generation: ${t?.metadata?.generation || 'absent'} · Applied generation: ${t?.status?.observedGeneration || 0}`));
@@ -39,7 +40,8 @@
       const table = document.createElement('table'), head = document.createElement('tr');
       head.append(text('th', 'From ↓ / To →')); zones.forEach(z => head.append(text('th', zoneName(z)))); table.append(head);
       zones.forEach(source => {
-        const a = zoneName(source), row = document.createElement('tr'); row.append(text('th', a));
+        const a = zoneName(source), row = document.createElement('tr'), label = text('th', a);
+        label.append(text('small', source.gatewayReady ? ' · ready' : ' · gateway unavailable')); row.append(label);
         zones.forEach(destination => {
           const b = zoneName(destination), cell = document.createElement('td'); row.append(cell);
           if (a === b) { cell.append(text('span', '—')); cell.className = 'diagonal'; return; }
@@ -54,6 +56,7 @@
           cell.append(button, text('small', t ? `desired ${t.metadata.generation} / applied ${t.status?.observedGeneration || 0}` : 'No edge · deny'));
         }); table.append(row);
       }); $('matrix').replaceChildren(table);
+      if (selected) details(...selected, trusts.find(t => t.spec.sourceZone === selected[0] && t.spec.destinationZone === selected[1]));
     }
     async function refresh() {
       try {
