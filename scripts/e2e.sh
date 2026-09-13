@@ -817,6 +817,12 @@ main() {
   start_app_port_forward "$ZONE_B"
   reset_test_edges
   create_client_pods
+  # A previous run may have left an allow policy in a gateway's xDS stream.
+  # The fixture objects are gone above, but do not begin the absent-edge case
+  # until both data-plane directions have settled to the documented deny-all
+  # baseline. This keeps repeated local/CI invocations independent.
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-baseline-a-to-b
+  wait_for_gateway_decision "$ZONE_B" "$ZONE_A" deny /e2e-baseline-b-to-a
 
   run_case 'default deny keeps destination counter unchanged' test_default_deny
   run_case 'allow A -> B reaches destination app' test_allow
