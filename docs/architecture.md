@@ -247,7 +247,9 @@ For each destination zone, reconcile all incoming `ZoneTrust` edges into exactly
 The policy has action `ALLOW` and contains:
 
 - one unconditional rule for the POC call-entry port `8080`;
-- one rule per allowed incoming edge on port `8443`, matching the exact source principal `spiffe://poc.example/ns/<source>/sa/zone-gateway`.
+- one rule per allowed incoming edge on port `8443`, matching the exact Istio source principal `poc.example/ns/<source>/sa/zone-gateway`.
+
+Istio omits the URI scheme in its policy representation. The certificate URI retains `spiffe://`. See [ADR 0002](adr/0002-istio-principal-representation.md).
 
 Keeping a single controller-owned policy per destination avoids overlapping generated resources and makes deny-all explicit: when no incoming edge is allowed, only port 8080 remains reachable and every request to 8443 is denied.
 

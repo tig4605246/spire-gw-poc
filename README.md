@@ -1,52 +1,133 @@
 # SPIRE zone gateway POC
 
-This repository is the implementation target for a kind-based proof of concept that compares two ways to enforce zone-to-zone workload trust at dedicated Envoy gateways:
+This POC compares two ways to enforce directional trust between zones through dedicated gateways.
 
-- **A — standalone Envoy:** Envoy obtains and rotates its X.509-SVID through the SPIRE Agent SDS API. A small Kubernetes controller is also Envoy's external authorization service.
-- **B — Envoy managed by Istio:** Istio programs one Envoy gateway per zone. The controller materializes the same `ZoneTrust` resources as Istio `AuthorizationPolicy` objects.
+- `standalone`: Envoy gets certificates through SPIRE Agent SDS and asks the controller to authorize each protected request.
+- `istio`: Istio configures the gateways. The controller translates each `ZoneTrust` into an Istio `AuthorizationPolicy`.
 
-Both variants preserve the same security boundary:
+Both modes use this request path:
 
 ```text
-caller -> source zone gateway == SPIRE mTLS ==> destination zone gateway -> plain HTTP -> app
+caller → source gateway ══ SPIRE mTLS ══ destination gateway → plain HTTP app
 ```
 
-Only gateways mount the SPIFFE CSI socket and handle SPIFFE identities. Application Pods do not have a sidecar, certificate, SPIFFE socket, mTLS code, or SPIFFE library.
+Apps have one container, no sidecar, no SPIFFE socket, and no certificate code. Cilium enforces NetworkPolicy so cross-zone callers cannot bypass the destination gateway.
 
-## Current status
+## Run the POC
 
-The architecture and implementation contract are complete. The POC itself is intentionally not implemented on this branch yet.
+Prerequisites: Linux, Docker, Go 1.26, kubectl, Python 3 with PyYAML, curl, OpenSSL, Make, tar, and SHA-256 tools. Docker needs internet access to the image registries. The tool installer supports `amd64` and `arm64`.
 
-- [Architecture](docs/architecture.md) — invariants, request paths, identity model, controller/API contract, and the two variants.
-- [Implementation plan](docs/implementation-plan.md) — target file tree, ordered work packages, exact verification matrix, and completion criteria.
-- [Architecture decisions](docs/adr/0001-zone-trust-control-plane.md) — why zone trust is authorization over an authenticated SPIFFE identity rather than dynamic trust-bundle mutation.
-- [Codex handoff](docs/codex-handoff.md) — a concise starting brief for the implementation task.
+```bash
+make tools
+make test
+make bootstrap MODE=standalone
+make e2e MODE=standalone
+make dashboard MODE=standalone
+```
 
-## Pinned baseline
+Open `http://127.0.0.1:8080`. Select a source-to-destination cell to change its desired trust. The dashboard shows the desired and applied generations separately.
 
-The design was checked on 2026-09-13 against current upstream releases and documentation.
+![Dashboard connected to the standalone cluster](docs/images/dashboard.png)
 
-| Component | Baseline | Role |
-|---|---:|---|
-| SPIRE | `v1.15.3` | SVID issuance, rotation, node/workload attestation |
-| SPIRE hardened Helm chart | `0.30.2` | Server, Agent, CSI driver, controller-manager |
-| Envoy | `v1.39.1` | Both variants' gateway data plane |
-| Istio | `1.31.0` | Variant B gateway configuration and authorization |
-| kind | `v0.33.0` | Local cluster lifecycle |
-| Kubernetes node image | `v1.34.1` | Deliberately inside SPIRE's documented Kubernetes quickstart range |
+For Istio:
 
-Version pins belong in one `versions.env` file when implementation begins. Image digests should be recorded after the first successful multi-architecture run.
+```bash
+make bootstrap MODE=istio
+make e2e MODE=istio
+make dashboard MODE=istio
+```
 
-## Upstream design references
+Each mode uses its own three-node cluster, named `spire-gw-standalone` or `spire-gw-istio`. Kubeconfigs live under `.state/<mode>/kubeconfig`. Commands do not change your default kubectl context. `KUBECONFIG` overrides the mode's kubeconfig when explicitly set.
 
-- [SPIRE Agent SDS support](https://spiffe.io/docs/latest/deploying/spire_agent/#envoy-sds-support)
-- [SPIRE Kubernetes quickstart](https://spiffe.io/docs/latest/try/getting-started-k8s/)
-- [SPIRE's Envoy X.509-SVID tutorial](https://spiffe.io/docs/latest/microservices/envoy-x509/readme/)
-- [Istio SPIRE integration](https://istio.io/latest/docs/ops/integrations/spire/)
-- [Istio Authorization Policy reference](https://istio.io/latest/docs/reference/config/security/authorization-policy/)
-- [Envoy external authorization filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter)
-- [Envoy Lua TLS connection APIs](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter.html#ssl-connection-object-api)
+Allow several minutes for the first bootstrap to download images. Each cluster runs SPIRE Server, three Agents, CSI, Cilium, two apps, two gateways, and the controller. Istio mode also runs Istiod. See [test evidence](docs/test-evidence.md) for the tested host and measured results.
 
-## License
+## Policy and inspection
+
+An edge permits only its stated direction. An absent or deleted edge denies traffic.
+
+```yaml
+apiVersion: security.poc.example/v1alpha1
+kind: ZoneTrust
+metadata:
+  name: zone-a-to-zone-b
+spec:
+  sourceZone: zone-a
+  destinationZone: zone-b
+  allowed: true
+```
+
+The dashboard writes this resource through the Kubernetes API. Its response reports acceptance. Applied status means the controller published the snapshot or observed the generated Istio policy. Istio traffic can converge after that status update through xDS. The e2e report measures both intervals.
+
+```bash
+KUBECONFIG="$PWD/.state/standalone/kubeconfig" kubectl get zonetrusts -o wide
+KUBECONFIG="$PWD/.state/standalone/kubeconfig" kubectl get zonetrust zone-a-to-zone-b -o yaml
+KUBECONFIG="$PWD/.state/standalone/kubeconfig" kubectl -n zone-a port-forward service/zone-gateway 18080:8080
+# In another terminal:
+curl http://127.0.0.1:18080/call/zone-b/demo
+```
+
+```bash
+make inspect MODE=standalone
+make inspect MODE=istio
+KUBECONFIG="$PWD/.state/istio/kubeconfig" .tools/bin/istioctl proxy-status
+KUBECONFIG="$PWD/.state/istio/kubeconfig" kubectl get authorizationpolicies -A
+```
+
+The gateway certificate identities are `spiffe://poc.example/ns/zone-a/sa/zone-gateway` and the corresponding `zone-b` URI. Istio policy principals omit `spiffe://`. Public certificate inspection never needs private key exports.
+
+## Versions
+
+[versions.env](versions.env) is the source for tool and image pins. The original design's Kubernetes `v1.34.1` tag was unavailable. The implemented platform uses a published image and a compatible Cilium release.
+
+| Component | Pin |
+| --- | --- |
+| SPIRE / hardened chart | `1.15.3` / `0.30.2` |
+| SPIRE CRD chart | `0.6.1` |
+| Standalone Envoy | `v1.39.1` |
+| Istio | `1.31.0` |
+| kind | `v0.33.0` |
+| Kubernetes | `v1.34.11`, digest in `versions.env` |
+| Cilium | `1.19.0` |
+
+Istio uses its bundled Envoy build. The standalone Envoy pin does not replace Istio's proxy image. [Upstream research](docs/upstream-research.md) records the verified API details and compatibility sources.
+
+## Troubleshooting
+
+If a gateway remains pending, inspect its events with `kubectl -n zone-a describe pod <pod>`. A missing CSI driver or socket usually indicates an incomplete SPIRE installation.
+
+If a gateway lacks an SVID, inspect `kubectl get clusterspiffeids zone-gateway -o yaml` and the SPIRE Server/controller-manager logs. The gateway needs its registration labels and `zone-gateway` service account.
+
+If standalone calls return 503, inspect the controller's readiness and the destination gateway logs. Authorization service failures deny requests. An unavailable Kubernetes API also invalidates the controller snapshot.
+
+If Istio does not converge, run `.tools/bin/istioctl analyze --all-namespaces` and `.tools/bin/istioctl proxy-status` with the mode's kubeconfig. Inspect the CSI mount on the regular `istio-proxy` container.
+
+If nodes or Pods fail during bootstrap, inspect `docker stats` and `kubectl get events -A --sort-by=.lastTimestamp`. Image downloads, disk capacity, and Docker memory limits can delay startup. Re-run the same bootstrap after you correct the cause.
+
+## Trade-offs and limits
+
+| Property | Standalone | Istio |
+| --- | --- | --- |
+| Policy enforcement | HTTP ext-authz per protected request | Generated Envoy RBAC |
+| Policy update path | Informer → snapshot | Informer → policy → Istiod → xDS |
+| Controller outage | Protected requests fail closed | Last accepted proxy policy continues |
+| Gateway configuration | Reviewed Envoy template | Gateway, VirtualService, DestinationRule |
+| Operational cost | Smaller platform, custom request-path service | Additional Istiod control plane |
+
+This is one kind cluster per mode and one SPIFFE trust domain. It does not demonstrate federation or production availability. Trust is at zone/service-account scope. The plain HTTP call entrypoint is a test harness, not end-user authentication.
+
+Dashboard authentication is omitted for local use. Its Service is accessible through localhost port-forward. Only gateway Pods can reach the separate authorization Service through the declared NetworkPolicy.
+
+The 120-second SVID lifetime supports a short functional rotation test. It is not a production rotation benchmark. Convergence measurements include the test harness and Kubernetes command overhead.
+
+## Cleanup
+
+```bash
+make destroy MODE=standalone
+make destroy MODE=istio
+```
+
+Cleanup deletes only the selected POC cluster. Local evidence remains under `.state/`.
+
+[Architecture](docs/architecture.md) · [Implementation plan](docs/implementation-plan.md) · [Decisions](docs/adr/) · [Evidence](docs/test-evidence.md)
 
 Apache-2.0. See [LICENSE](LICENSE).
