@@ -1,0 +1,40 @@
+# Applied before the controller becomes ready. These policies select the
+# gateways and allow only the public call entrypoint, making port 8443 deny-all
+# until a controller-owned reconciliation materializes incoming trust edges.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-generated
+  namespace: zone-a
+  labels:
+    app.kubernetes.io/managed-by: zone-trust-controller
+    security.poc.example/destination-zone: zone-a
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      security.poc.example/zone: zone-a
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-generated
+  namespace: zone-b
+  labels:
+    app.kubernetes.io/managed-by: zone-trust-controller
+    security.poc.example/destination-zone: zone-b
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      security.poc.example/zone: zone-b
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080"]

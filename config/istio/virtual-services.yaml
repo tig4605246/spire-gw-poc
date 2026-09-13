@@ -1,0 +1,93 @@
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: zone-gateway
+  namespace: zone-a
+spec:
+  selector:
+    app.kubernetes.io/component: zone-gateway
+    security.poc.example/zone: zone-a
+  servers:
+    - port: { number: 8080, name: http-call-entry, protocol: HTTP }
+      hosts: ["*"]
+    - port: { number: 8443, name: https-protected, protocol: HTTPS }
+      hosts: ["*"]
+      tls: { mode: ISTIO_MUTUAL }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: zone-gateway
+  namespace: zone-a
+spec:
+  hosts: ["*"]
+  gateways: [zone-gateway]
+  http:
+    - match:
+        - port: 8080
+          uri: { prefix: /call/zone-b/ }
+      headers:
+        request:
+          remove: [x-spiffe-peer-id, x-destination-zone, x-source-zone]
+      rewrite: { uri: / }
+      route:
+        - destination:
+            host: zone-gateway.zone-b.svc.cluster.local
+            port: { number: 8443 }
+    - match:
+        - port: 8443
+          uri: { prefix: / }
+      headers:
+        request:
+          remove: [x-spiffe-peer-id, x-destination-zone, x-source-zone]
+      route:
+        - destination:
+            host: zone-app.zone-a.svc.cluster.local
+            port: { number: 8080 }
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: zone-gateway
+  namespace: zone-b
+spec:
+  selector:
+    app.kubernetes.io/component: zone-gateway
+    security.poc.example/zone: zone-b
+  servers:
+    - port: { number: 8080, name: http-call-entry, protocol: HTTP }
+      hosts: ["*"]
+    - port: { number: 8443, name: https-protected, protocol: HTTPS }
+      hosts: ["*"]
+      tls: { mode: ISTIO_MUTUAL }
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: zone-gateway
+  namespace: zone-b
+spec:
+  hosts: ["*"]
+  gateways: [zone-gateway]
+  http:
+    - match:
+        - port: 8080
+          uri: { prefix: /call/zone-a/ }
+      headers:
+        request:
+          remove: [x-spiffe-peer-id, x-destination-zone, x-source-zone]
+      rewrite: { uri: / }
+      route:
+        - destination:
+            host: zone-gateway.zone-a.svc.cluster.local
+            port: { number: 8443 }
+    - match:
+        - port: 8443
+          uri: { prefix: / }
+      headers:
+        request:
+          remove: [x-spiffe-peer-id, x-destination-zone, x-source-zone]
+      route:
+        - destination:
+            host: zone-app.zone-b.svc.cluster.local
+            port: { number: 8080 }
