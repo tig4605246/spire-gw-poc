@@ -37,6 +37,13 @@ else
 fi
 REQUEST_TIMEOUT=${E2E_REQUEST_TIMEOUT:-8}
 CONVERGENCE_TIMEOUT=${E2E_CONVERGENCE_TIMEOUT:-90}
+# A ZoneTrust status update is observed by the controller before an Istio
+# AuthorizationPolicy update has necessarily settled in the gateway proxy. A
+# single matching response can therefore still be an older xDS snapshot. Keep
+# the decision stable over a short bounded window before a security assertion
+# takes its counter baseline or evaluates headers.
+DECISION_STABLE_SAMPLES=${E2E_DECISION_STABLE_SAMPLES:-5}
+DECISION_STABLE_INTERVAL=${E2E_DECISION_STABLE_INTERVAL:-0.25}
 TOGGLE_SAMPLES=${E2E_TOGGLE_SAMPLES:-20}
 SVID_ROTATION_TIMEOUT=${E2E_SVID_ROTATION_TIMEOUT:-360}
 ISTIOCTL=${ISTIOCTL:-"$ROOT/.tools/bin/istioctl"}
@@ -232,6 +239,41 @@ is_forbidden_response() {
   [[ "$code" == 403 ]]
 }
 
+# Failure evidence deliberately includes only an HTTP status and header names.
+# It never writes a response body (which could contain caller-provided values)
+# into CI logs or evidence files.
+response_summary() {
+  local output=$1
+  printf '%s\n' "$output" | python3 -c '
+import json,sys
+lines=sys.stdin.read().splitlines()
+code=lines[-1] if lines else "<empty>"
+body="\n".join(lines[:-1])
+try:
+    headers=json.loads(body).get("headers", {})
+    names=sorted(str(name).lower() for name in headers)
+    print(f"http_code={code} header_names={names}")
+except Exception:
+    print(f"http_code={code} response_body=non-json-or-empty")
+'
+}
+
+assert_protected_headers_absent() {
+  local output=$1 body
+  body=$(printf '%s\n' "$output" | request_body) || return 1
+  if ! printf '%s' "$body" | python3 -c '
+import json,sys
+headers=json.load(sys.stdin).get("headers", {})
+protected={"x-spiffe-peer-id", "x-destination-zone"}
+found=sorted(str(name).lower() for name in headers if str(name).lower() in protected)
+assert not found, found
+'
+  then
+    response_summary "$output" >&2
+    return 1
+  fi
+}
+
 edge_name() { printf '%s-to-%s' "$1" "$2"; }
 
 reset_test_edges() {
@@ -305,20 +347,52 @@ assert_counter_unchanged_after_denied_call() {
   local source=$1 destination=$2 before output after
   before=$(app_requests "$destination") || return 1
   output=$(gateway_call "$source" "$destination" /e2e-denied) || true
-  is_forbidden_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
+  is_forbidden_response "$output" || { response_summary "$output" >&2; return 1; }
   after=$(app_requests "$destination") || return 1
   [[ "$before" == "$after" ]] || fail "denied request reached $destination app ($before -> $after)"
 }
 
 wait_for_gateway_decision() {
-  local source=$1 destination=$2 expected=$3 path=$4 output deadline
+  local source=$1 destination=$2 expected=$3 path=$4 output deadline stable=0
   deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
   while (( SECONDS < deadline )); do
     output=$(gateway_call "$source" "$destination" "$path") || true
-    if [[ "$expected" == allow ]] && is_successful_response "$output"; then return 0; fi
-    if [[ "$expected" == deny ]] && is_forbidden_response "$output"; then return 0; fi
-    sleep 0.25
+    if { [[ "$expected" == allow ]] && is_successful_response "$output"; } || \
+       { [[ "$expected" == deny ]] && is_forbidden_response "$output"; }; then
+      stable=$((stable + 1))
+      if (( stable >= DECISION_STABLE_SAMPLES )); then return 0; fi
+    else
+      stable=0
+    fi
+    sleep "$DECISION_STABLE_INTERVAL"
   done
+  log "    timed out waiting for stable $expected decision ($DECISION_STABLE_SAMPLES samples): $(response_summary "${output:-}")"
+  return 1
+}
+
+# Keep retries restricted to propagation failures. If a spoofed request ever
+# reaches the app successfully, validate its headers immediately and fail on a
+# leak rather than retrying past the evidence. Failed transport/RBAC probes are
+# required not to increment the app counter before trying again.
+wait_for_clean_spoof_allow() {
+  local source=$1 destination=$2 path=$3 before after output deadline
+  shift 3
+  before=$(app_requests "$destination") || return 1
+  deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    output=$(gateway_call "$source" "$destination" "$path" "$@") || true
+    if is_successful_response "$output"; then
+      assert_protected_headers_absent "$output" || return 1
+      return 0
+    fi
+    after=$(app_requests "$destination") || return 1
+    if [[ "$before" != "$after" ]]; then
+      fail "rejected spoof convergence probe reached $destination app ($before -> $after)"
+      return 1
+    fi
+    sleep "$DECISION_STABLE_INTERVAL"
+  done
+  log "    timed out waiting for spoof request to be allowed: $(response_summary "${output:-}")"
   return 1
 }
 
@@ -377,10 +451,11 @@ test_deleted_edge_deny() {
   kubectl delete zonetrust "$(edge_name "$ZONE_A" "$ZONE_B")" >/dev/null || return 1
   printf 'deleted fixture edge: %s\n' "$(edge_name "$ZONE_A" "$ZONE_B")" >>"$STATE_DIR/actions.log" || return 1
   if [[ "$MODE" == istio ]]; then
-    # A non-2xx response can be a transient xDS/upstream failure. First prove
-    # the generated API policy no longer contains the deleted principal, then
-    # require the destination gateway's RBAC 403 before checking app isolation.
-    local deadline=$((SECONDS + CONVERGENCE_TIMEOUT)) output
+    # First prove the generated API policy no longer contains the deleted
+    # principal. The data-plane helper below then requires a stable series of
+    # RBAC 403s; a lone 403 can be an older xDS snapshot while a previous allow
+    # update is still in flight.
+    local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
     while (( SECONDS < deadline )); do
       if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json | python3 -c '
 import json,sys
@@ -392,14 +467,13 @@ for rule in policy.get("spec", {}).get("rules", []):
     for target in rule.get("to", []):
         ports=target.get("operation", {}).get("ports", [])
         assert "8443" not in ports
-' 2>/dev/null
-      then
-        output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-deleted-edge) || true
-        if is_forbidden_response "$output"; then break; fi
+' 2>/dev/null; then
+        break
       fi
       sleep 0.25
     done
-    [[ ${output:-} ]] && is_forbidden_response "$output" || return 1
+    (( SECONDS < deadline )) || return 1
+    wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-deleted-edge || return 1
   else
     wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-deleted-edge || return 1
   fi
@@ -412,8 +486,10 @@ test_directional() {
   runtime_before=$(workload_fingerprint) || return 1
   set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
   set_edge "$ZONE_B" "$ZONE_A" false >/dev/null || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" allow /e2e-directional-allow || return 1
+  wait_for_gateway_decision "$ZONE_B" "$ZONE_A" deny /e2e-directional-deny || return 1
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-directional) || return 1
-  is_successful_response "$output" || return 1
+  is_successful_response "$output" || { response_summary "$output" >&2; return 1; }
   assert_counter_unchanged_after_denied_call "$ZONE_B" "$ZONE_A" || return 1
   assert_workloads_unchanged "$runtime_before"
 }
@@ -427,36 +503,27 @@ test_live_toggle() {
 }
 
 test_spoof_header() {
-  local output body before after runtime_before
+  local output before after runtime_before
   runtime_before=$(workload_fingerprint) || return 1
   set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
-  output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-spoof \
+  wait_for_clean_spoof_allow "$ZONE_A" "$ZONE_B" /e2e-spoof \
     -H 'x-spiffe-peer-id: spiffe://poc.example/ns/zone-b/sa/zone-gateway' \
-    -H 'x-destination-zone: zone-a') || return 1
-  is_successful_response "$output" || return 1
-  body=$(printf '%s\n' "$output" | request_body) || return 1
-  # The echo app is intentionally used as the final observer: protected headers
-  # must not survive Envoy's internal header cleanup.
-  if ! printf '%s' "$body" | python3 -c '
-import json,sys
-h={k.lower(): v for k,v in json.load(sys.stdin).get("headers", {}).items()}
-assert "x-spiffe-peer-id" not in h, h
-assert "x-destination-zone" not in h, h
-'
-  then
-    return 1
-  fi
+    -H 'x-destination-zone: zone-a' || return 1
   # A caller cannot turn an explicit deny into an allow by claiming to be a
-  # different gateway. Check this separately from header stripping so both
-  # security properties have direct evidence.
+  # different gateway. First reach a stable exact 403, then take the app
+  # baseline; the single forged assertion below is intentionally not retried.
   set_edge "$ZONE_A" "$ZONE_B" false >/dev/null || return 1
+  wait_for_gateway_decision "$ZONE_A" "$ZONE_B" deny /e2e-spoof-deny-converged || return 1
   before=$(app_requests "$ZONE_B") || return 1
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-spoof-deny \
     -H 'x-spiffe-peer-id: spiffe://poc.example/ns/zone-a/sa/zone-gateway' \
     -H 'x-destination-zone: zone-b') || true
-  is_forbidden_response "$output" || return 1
+  is_forbidden_response "$output" || { response_summary "$output" >&2; return 1; }
   after=$(app_requests "$ZONE_B") || return 1
-  [[ "$before" == "$after" ]] || return 1
+  if [[ "$before" != "$after" ]]; then
+    fail "forged denied request reached $ZONE_B app ($before -> $after)"
+    return 1
+  fi
   assert_workloads_unchanged "$runtime_before"
 }
 

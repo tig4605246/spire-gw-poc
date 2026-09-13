@@ -87,7 +87,9 @@ The [dashboard screenshot](images/dashboard.png) shows the live controller state
 
 The [workflow](../.github/workflows/ci.yaml) runs unit, race, generation, manifest, Envoy, multi-architecture build, and both cluster suites. The [Actions history](https://github.com/tig4605246/spire-gw-poc/actions/workflows/ci.yaml) contains the independent runner results and downloadable e2e evidence.
 
-The first runner check job passed. Its bootstrap jobs exposed a missing `rg` utility on the runner. The bootstrap now uses standard `grep` for that fixed-string assertion. Final runner status is available in the linked Actions history.
+The first runner check job passed. Its bootstrap jobs exposed a missing `rg` utility on the runner. The bootstrap now uses standard `grep` for that fixed-string assertion.
+
+Later runners exposed an Istio test race after policy changes. A focused local reproduction observed transient 403 responses after an initial successful allow probe. Every successful spoof response had the protected headers removed. The harness now separates traffic convergence from its strict header, denial, and app-counter assertions. Final runner status is available in the linked Actions history.
 
 ## Interpretation and limitations
 
