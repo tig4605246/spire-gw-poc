@@ -1,0 +1,28 @@
+# Install with the pinned istioctl. The custom template follows the official
+# SPIRE integration; gateways use regular containers even on clusters where
+# sidecar injection otherwise uses native sidecars.
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  profile: minimal
+  meshConfig:
+    trustDomain: poc.example
+  components:
+    ingressGateways: []
+    egressGateways: []
+  values:
+    sidecarInjectorWebhook:
+      templates:
+        spire: |
+          spec:
+            containers:
+            - name: istio-proxy
+              volumeMounts:
+              - name: workload-socket
+                mountPath: /run/secrets/workload-spiffe-uds
+                readOnly: true
+            volumes:
+            - name: workload-socket
+              csi:
+                driver: csi.spiffe.io
+                readOnly: true

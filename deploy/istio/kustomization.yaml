@@ -1,0 +1,32 @@
+resources:
+  - ../../config/rbac
+  - ../../config/controller
+  - ../../config/common
+  - ../../config/istio
+patches:
+  # The injector's default policy is disabled. Explicitly enable it for the
+  # Istio overlay; plain applications opt out with their Pod annotation.
+  - target:
+      version: v1
+      kind: Namespace
+      name: zone-a
+    patch: |-
+      - op: add
+        path: /metadata/labels/istio-injection
+        value: enabled
+  - target:
+      version: v1
+      kind: Namespace
+      name: zone-b
+    patch: |-
+      - op: add
+        path: /metadata/labels/istio-injection
+        value: enabled
+  - target:
+      kind: Deployment
+      name: zone-trust-controller
+      namespace: control-plane
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: istio

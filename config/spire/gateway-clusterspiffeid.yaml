@@ -1,0 +1,19 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: zone-gateway
+spec:
+  # The hardened chart's controller manager deliberately ignores unclassed CRs.
+  className: spire-system-spire
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/zone-gateway
+  namespaceSelector:
+    matchLabels:
+      security.poc.example/zone: "true"
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      spiffe.io/spire-managed-identity: "true"
+  workloadSelectorTemplates:
+    - k8s:ns:{{ .PodMeta.Namespace }}
+    - k8s:sa:zone-gateway
+  ttl: 120s

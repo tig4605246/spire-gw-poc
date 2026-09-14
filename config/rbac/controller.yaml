@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zone-trust-controller
+  namespace: control-plane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zone-trust-controller
+rules:
+  - apiGroups: [security.poc.example]
+    resources: [zonetrusts]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [security.poc.example]
+    resources: [zonetrusts/status]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zone-trust-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zone-trust-controller
+subjects:
+  - kind: ServiceAccount
+    name: zone-trust-controller
+    namespace: control-plane
+---
+# Kubernetes RBAC does not apply resourceNames to CREATE. The named rule below
+# limits existing-object mutation; the separate namespace-scoped CREATE grant
+# lets server-side apply recreate the dynamic policy after accidental deletion.
+# The guard installed from authorizationpolicy-create-guard.yaml before this
+# Role is granted limits CREATE to zone-trust-generated, so the controller
+# cannot create a second policy that weakens the bootstrap-owned 8080 baseline.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zone-trust-generated-policy
+  namespace: zone-a
+rules:
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    resourceNames: [zone-trust-generated]
+    verbs: [get, patch, update, delete]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zone-trust-generated-policy
+  namespace: zone-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zone-trust-generated-policy
+subjects:
+  - kind: ServiceAccount
+    name: zone-trust-controller
+    namespace: control-plane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zone-trust-generated-policy
+  namespace: zone-b
+rules:
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    resourceNames: [zone-trust-generated]
+    verbs: [get, patch, update, delete]
+  - apiGroups: [security.istio.io]
+    resources: [authorizationpolicies]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zone-trust-generated-policy
+  namespace: zone-b
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: zone-trust-generated-policy
+subjects:
+  - kind: ServiceAccount
+    name: zone-trust-controller
+    namespace: control-plane

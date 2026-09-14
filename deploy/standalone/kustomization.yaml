@@ -1,0 +1,5 @@
+resources:
+  - ../../config/rbac
+  - ../../config/controller
+  - ../../config/common
+  - ../../config/standalone

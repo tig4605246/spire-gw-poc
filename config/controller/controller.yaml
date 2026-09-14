@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zone-trust-controller
+  namespace: control-plane
+  labels:
+    app.kubernetes.io/name: zone-trust-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zone-trust-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zone-trust-controller
+    spec:
+      serviceAccountName: zone-trust-controller
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: spire-gw-controller:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POLICY_BACKEND
+              value: standalone
+          ports:
+            - name: dashboard
+              containerPort: 8080
+            - name: authz
+              containerPort: 9000
+            - name: metrics
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zone-trust-controller
+  namespace: control-plane
+spec:
+  selector:
+    app.kubernetes.io/name: zone-trust-controller
+  ports:
+    - name: dashboard
+      port: 8080
+      targetPort: dashboard
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zone-trust-authorizer
+  namespace: control-plane
+spec:
+  selector:
+    app.kubernetes.io/name: zone-trust-controller
+  ports:
+    - name: authz
+      port: 9000
+      targetPort: authz
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controller-authorizer-only
+  namespace: control-plane
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: zone-trust-controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              security.poc.example/zone: "true"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: zone-gateway
+      ports:
+        - protocol: TCP
+          port: 9000

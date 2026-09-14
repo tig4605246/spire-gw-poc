@@ -1,0 +1,3 @@
+resources:
+  - authorizationpolicy-create-guard.yaml
+  - controller.yaml

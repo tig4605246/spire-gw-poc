@@ -1,0 +1,38 @@
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: zone-b-gateway-mtls
+  namespace: zone-a
+spec:
+  host: zone-gateway.zone-b.svc.cluster.local
+  trafficPolicy:
+    portLevelSettings:
+      - port: { number: 8443 }
+        # Envoy's listener-level RBAC policy can be replaced while a pooled
+        # upstream connection is still draining. One request per connection
+        # keeps each authorization decision on a fresh mTLS connection.
+        connectionPool:
+          http:
+            maxRequestsPerConnection: 1
+        tls:
+          mode: ISTIO_MUTUAL
+          subjectAltNames: [spiffe://poc.example/ns/zone-b/sa/zone-gateway]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: zone-a-gateway-mtls
+  namespace: zone-b
+spec:
+  host: zone-gateway.zone-a.svc.cluster.local
+  trafficPolicy:
+    portLevelSettings:
+      - port: { number: 8443 }
+        # Keep the reverse direction subject to the same connection lifecycle
+        # and authorization semantics as zone-a -> zone-b.
+        connectionPool:
+          http:
+            maxRequestsPerConnection: 1
+        tls:
+          mode: ISTIO_MUTUAL
+          subjectAltNames: [spiffe://poc.example/ns/zone-a/sa/zone-gateway]
