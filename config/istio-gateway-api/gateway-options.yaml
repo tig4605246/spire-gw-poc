@@ -34,7 +34,7 @@ data:
                   readOnly: true
           volumes:
             - name: workload-socket
-              $patch: replace
+              emptyDir: null
               csi:
                 driver: csi.spiffe.io
                 readOnly: true
@@ -90,7 +90,7 @@ data:
                   readOnly: true
           volumes:
             - name: workload-socket
-              $patch: replace
+              emptyDir: null
               csi:
                 driver: csi.spiffe.io
                 readOnly: true
