@@ -1,0 +1,19 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: zone-gateway-api
+spec:
+  className: spire-system-spire
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}
+  namespaceSelector:
+    matchLabels:
+      security.poc.example/zone: "true"
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: zone-gateway
+      spiffe.io/spire-managed-identity: "true"
+      gateway.networking.k8s.io/gateway-name: zone-gateway
+  workloadSelectorTemplates:
+    - k8s:ns:{{ .PodMeta.Namespace }}
+    - k8s:sa:{{ .PodSpec.ServiceAccountName }}
+  ttl: 120s

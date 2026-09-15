@@ -12,6 +12,7 @@ import (
 	v1alpha1 "github.com/tig4605246/spire-gw-poc/api/v1alpha1"
 	"github.com/tig4605246/spire-gw-poc/internal/authz"
 	"github.com/tig4605246/spire-gw-poc/internal/istio"
+	istiogatewayapi "github.com/tig4605246/spire-gw-poc/internal/istio_gateway_api"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,29 +33,31 @@ func (e *policyApplyError) Error() string { return e.cause.Error() }
 func (e *policyApplyError) Unwrap() error { return e.cause }
 
 const (
-	BackendStandalone = "standalone"
-	BackendIstio      = "istio"
-	ZoneLabel         = "security.poc.example/zone"
-	SyncInterval      = 10 * time.Second
-	APITimeout        = 5 * time.Second
+	BackendStandalone      = "standalone"
+	BackendIstio           = "istio"
+	BackendIstioGatewayAPI = "istio-gateway-api"
+	ZoneLabel              = "security.poc.example/zone"
+	SyncInterval           = 10 * time.Second
+	APITimeout             = 5 * time.Second
 )
 
 type EventPublisher interface{ Publish(event string, value any) }
 
 type Reconciler struct {
 	client.Client
-	APIReader client.Reader
-	Backend   string
-	Store     *authz.Store
-	Istio     istio.Applicator
-	Events    EventPublisher
-	Metrics   *Metrics
-	clock     func() time.Time
-	mu        sync.Mutex // serializes full-state rebuilds and status transitions
+	APIReader       client.Reader
+	Backend         string
+	Store           *authz.Store
+	Istio           istio.Applicator
+	IstioGatewayAPI istiogatewayapi.Applicator
+	Events          EventPublisher
+	Metrics         *Metrics
+	clock           func() time.Time
+	mu              sync.Mutex // serializes full-state rebuilds and status transitions
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.Backend != BackendStandalone && r.Backend != BackendIstio {
+	if r.Backend != BackendStandalone && r.Backend != BackendIstio && r.Backend != BackendIstioGatewayAPI {
 		return fmt.Errorf("unsupported POLICY_BACKEND %q", r.Backend)
 	}
 	if r.Store == nil {
@@ -140,6 +143,21 @@ func (r *Reconciler) Refresh(ctx context.Context) error {
 		empty, _ := authz.BuildSnapshot(nil, r.now())
 		r.Store.Publish(empty)
 		backendName = "istio-authorization-policy"
+	case BackendIstioGatewayAPI:
+		if err := r.applyIstioGatewayAPI(ctx, trusts.Items); err != nil {
+			r.Store.MarkUnready()
+			var applyErr *policyApplyError
+			if errors.As(err, &applyErr) {
+				r.markFailedExpected(ctx, applyErr.affected, err)
+			}
+			refreshErr = err
+			return refreshErr
+		}
+		// The standalone endpoint is never used in this mode, but an empty snapshot
+		// preserves fail-closed behavior should it accidentally be contacted.
+		empty, _ := authz.BuildSnapshot(nil, r.now())
+		r.Store.Publish(empty)
+		backendName = "istio-gateway-api-authorization-policy"
 	}
 	for _, trust := range trusts.Items {
 		if err := r.markApplied(ctx, trust, backendName); err != nil {
@@ -182,10 +200,46 @@ func (r *Reconciler) applyIstio(ctx context.Context, trusts []v1alpha1.ZoneTrust
 	return nil
 }
 
+// applyIstioGatewayAPI mirrors the destination discovery used by the Istio
+// backend, while keeping its Gateway API policy renderer and targetRefs
+// contract isolated from the selector-based Istio renderer.
+func (r *Reconciler) applyIstioGatewayAPI(ctx context.Context, trusts []v1alpha1.ZoneTrust) error {
+	destinations := map[string]struct{}{}
+	var namespaces corev1.NamespaceList
+	if err := r.APIReader.List(ctx, &namespaces, client.MatchingLabels{ZoneLabel: "true"}); err != nil {
+		return fmt.Errorf("list zones: %w", err)
+	}
+	for _, namespace := range namespaces.Items {
+		destinations[namespace.Name] = struct{}{}
+	}
+	for _, trust := range trusts {
+		destinations[trust.Spec.DestinationZone] = struct{}{}
+	}
+	ordered := make([]string, 0, len(destinations))
+	for destination := range destinations {
+		ordered = append(ordered, destination)
+	}
+	sort.Strings(ordered)
+	for _, destination := range ordered {
+		if err := r.IstioGatewayAPI.Apply(ctx, destination, trusts); err != nil {
+			affected := make([]v1alpha1.ZoneTrust, 0)
+			for _, trust := range trusts {
+				if trust.Spec.DestinationZone == destination {
+					affected = append(affected, trust)
+				}
+			}
+			return &policyApplyError{affected: affected, cause: fmt.Errorf("apply Gateway API AuthorizationPolicy for %s: %w", destination, err)}
+		}
+	}
+	return nil
+}
+
 func (r *Reconciler) markFailedExpected(ctx context.Context, expected []v1alpha1.ZoneTrust, cause error) {
 	backend := "ext-authz"
 	if r.Backend == BackendIstio {
 		backend = "istio-authorization-policy"
+	} else if r.Backend == BackendIstioGatewayAPI {
+		backend = "istio-gateway-api-authorization-policy"
 	}
 	for _, edge := range expected {
 		_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {

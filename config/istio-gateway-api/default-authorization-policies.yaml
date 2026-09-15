@@ -1,0 +1,39 @@
+# Bootstrap owns this policy before the Gateway exists.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-baseline
+  namespace: zone-a
+  labels:
+    app.kubernetes.io/managed-by: zone-trust-bootstrap
+    security.poc.example/destination-zone: zone-a
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: zone-gateway
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080"]
+---
+# Bootstrap owns this policy before the Gateway exists.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: zone-trust-baseline
+  namespace: zone-b
+  labels:
+    app.kubernetes.io/managed-by: zone-trust-bootstrap
+    security.poc.example/destination-zone: zone-b
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: zone-gateway
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8080"]

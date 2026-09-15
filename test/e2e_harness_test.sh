@@ -119,3 +119,46 @@ if wait_istio_active_listener_with_dynamic_deny_all; then
   exit 1
 fi
 printf 'e2e missing versus recreated deny-all listener regression tests passed\n'
+
+# Scheme C must bind the Gateway API object, not the generated Deployment
+# selector, and it must use the generated ServiceAccount in its principal.
+# Exercise those production helpers with JSON-only kubectl mocks; this catches
+# a future regression without requiring a cluster or generated Gateway Pod.
+# shellcheck disable=SC2034 # Consumed by the sourced dynamic-policy helper.
+ZONE_A=zone-a
+# shellcheck disable=SC2034 # Retained to model normal harness context.
+ZONE_B=zone-b
+# shellcheck disable=SC1090 # Load the exact targetRef/principal helpers.
+source <(awk '
+  /^assert_istio_baseline\(\)/ { emit=1 }
+  /^wait_istio_active_listener_without_dynamic_policy\(\)/ { exit }
+  emit { print }
+' "$ROOT/scripts/e2e.sh")
+MODE=istio-gateway-api
+GATEWAY_API_NAME=zone-gateway
+GATEWAY_SERVICE_ACCOUNT=zone-gateway-istio
+CONVERGENCE_TIMEOUT=1
+MOCK_GATEWAY_API_POLICY=valid
+kubectl() {
+  case "$*" in
+    *zone-trust-baseline*)
+      if [[ "$MOCK_GATEWAY_API_POLICY" == valid ]]; then
+        printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"zone-trust-bootstrap"}},"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"Gateway","name":"zone-gateway"}],"rules":[{"to":[{"operation":{"ports":["8080"]}}]}]}}'
+      else
+        printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"zone-trust-bootstrap"}},"spec":{"selector":{"matchLabels":{"app.kubernetes.io/component":"zone-gateway"}},"rules":[{"to":[{"operation":{"ports":["8080"]}}]}]}}'
+      fi
+      ;;
+    *zone-trust-generated*)
+      printf '%s\n' '{"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"Gateway","name":"zone-gateway"}],"rules":[{"from":[{"source":{"principals":["poc.example/ns/zone-a/sa/zone-gateway-istio"]}}],"to":[{"operation":{"ports":["8443"]}}]}]}}'
+      ;;
+    *) printf 'unexpected kubectl mock call: %s\n' "$*" >&2; return 1 ;;
+  esac
+}
+assert_istio_baseline
+wait_dynamic_policy_allows_a_to_b
+MOCK_GATEWAY_API_POLICY=selector
+if assert_istio_baseline 2>"$TEMP_DIR/gateway-api-selector-rejection.log"; then
+  printf 'Gateway API baseline selector was accepted instead of targetRefs\n' >&2
+  exit 1
+fi
+printf 'e2e Gateway API targetRef and generated-principal regression tests passed\n'

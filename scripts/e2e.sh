@@ -10,7 +10,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
 source "$ROOT/versions.env"
 MODE=${MODE:-standalone}
-case "$MODE" in standalone|istio) ;; *) echo "MODE must be standalone or istio" >&2; exit 2 ;; esac
+case "$MODE" in standalone|istio|istio-gateway-api) ;; *) echo "MODE must be standalone, istio, or istio-gateway-api" >&2; exit 2 ;; esac
 export KUBECONFIG=${KUBECONFIG:-"$ROOT/.state/$MODE/kubeconfig"}
 
 ZONE_A=${E2E_ZONE_A:-zone-a}
@@ -19,8 +19,21 @@ E2E_NAMESPACE=${E2E_NAMESPACE:-poc-e2e}
 CONTROL_NAMESPACE=${E2E_CONTROL_NAMESPACE:-control-plane}
 CONTROLLER_DEPLOYMENT=${E2E_CONTROLLER_DEPLOYMENT:-zone-trust-controller}
 CONTROLLER_SERVICE=${E2E_CONTROLLER_SERVICE:-zone-trust-controller}
-GATEWAY_DEPLOYMENT=${E2E_GATEWAY_DEPLOYMENT:-zone-gateway}
-GATEWAY_SERVICE=${E2E_GATEWAY_SERVICE:-zone-gateway}
+if [[ "$MODE" == istio-gateway-api ]]; then
+  # Gateway API owns a Gateway named zone-gateway and Istio automatically
+  # creates its independently named workload resources. Keep these identities
+  # separate: policy targetRefs bind the Gateway, while traffic uses its
+  # generated Service and SPIRE registers its generated ServiceAccount.
+  GATEWAY_API_NAME=${E2E_GATEWAY_API_NAME:-zone-gateway}
+  GATEWAY_DEPLOYMENT=${E2E_GATEWAY_DEPLOYMENT:-zone-gateway-istio}
+  GATEWAY_SERVICE=${E2E_GATEWAY_SERVICE:-zone-gateway-istio}
+  GATEWAY_SERVICE_ACCOUNT=${E2E_GATEWAY_SERVICE_ACCOUNT:-zone-gateway-istio}
+else
+  GATEWAY_API_NAME=${E2E_GATEWAY_API_NAME:-zone-gateway}
+  GATEWAY_DEPLOYMENT=${E2E_GATEWAY_DEPLOYMENT:-zone-gateway}
+  GATEWAY_SERVICE=${E2E_GATEWAY_SERVICE:-zone-gateway}
+  GATEWAY_SERVICE_ACCOUNT=${E2E_GATEWAY_SERVICE_ACCOUNT:-zone-gateway}
+fi
 APP_DEPLOYMENT=${E2E_APP_DEPLOYMENT:-zone-app}
 APP_SERVICE=${E2E_APP_SERVICE:-zone-app}
 CLIENT_POD=${E2E_CLIENT_POD:-zone-trust-e2e-client}
@@ -30,7 +43,7 @@ DIRECT_CLIENT_POD=${E2E_DIRECT_CLIENT_POD:-zone-trust-direct-client}
 CURL_IMAGE=${E2E_CURL_IMAGE:-$CURL_IMAGE}
 if [[ -n ${E2E_GATEWAY_ADMIN_PORT:-} ]]; then
   GATEWAY_ADMIN_PORT=$E2E_GATEWAY_ADMIN_PORT
-elif [[ "$MODE" == istio ]]; then
+elif [[ "$MODE" == istio || "$MODE" == istio-gateway-api ]]; then
   GATEWAY_ADMIN_PORT=15000
 else
   GATEWAY_ADMIN_PORT=9901
@@ -55,8 +68,11 @@ fi
 for command in kubectl curl python3 awk sort date; do
   command -v "$command" >/dev/null || { echo "required command not found: $command" >&2; exit 2; }
 done
-if [[ "$MODE" == istio ]]; then
+if [[ "$MODE" == istio || "$MODE" == istio-gateway-api ]]; then
   [[ -x "$ISTIOCTL" ]] || { echo "istioctl is required for Istio e2e: $ISTIOCTL" >&2; exit 2; }
+fi
+if [[ "$MODE" == istio-gateway-api ]]; then
+  command -v openssl >/dev/null || { echo "openssl is required for Gateway API TLS acceptance" >&2; exit 2; }
 fi
 
 EVIDENCE_ROOT="$ROOT/.state/$MODE/evidence"
@@ -90,6 +106,8 @@ trap cleanup EXIT INT TERM
 
 log() { printf '%s\n' "$*" >&2; }
 now_ms() { date +%s%3N; }
+is_istio_mode() { [[ "$MODE" == istio || "$MODE" == istio-gateway-api ]]; }
+is_gateway_api_mode() { [[ "$MODE" == istio-gateway-api ]]; }
 
 run_case() {
   local name=$1
@@ -116,6 +134,9 @@ require_cluster_prerequisites() {
     kubectl -n "$zone" rollout status "deployment/$APP_DEPLOYMENT" --timeout=120s >/dev/null
     kubectl -n "$zone" rollout status "deployment/$GATEWAY_DEPLOYMENT" --timeout=180s >/dev/null
   done
+  if is_gateway_api_mode; then
+    "$ROOT/scripts/check-gateway-api.sh" | tee "$STATE_DIR/gateway-api-preflight.txt"
+  fi
 }
 
 # Creates a port-forward and assigns its local port to the named variable.
@@ -421,13 +442,19 @@ assert_workloads_unchanged() {
 }
 
 assert_istio_baseline() {
-  kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-baseline -o json | python3 -c '
-import json,sys
+  kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-baseline -o json | MODE="$MODE" GATEWAY_API_NAME="$GATEWAY_API_NAME" python3 -c '
+import json,os,sys
 p=json.load(sys.stdin)
 assert p.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by") == "zone-trust-bootstrap", p
 assert p.get("spec", {}).get("rules") == [{"to": [{"operation": {"ports": ["8080"]}}]}], p.get("spec")
+if os.environ["MODE"] == "istio-gateway-api":
+    assert p.get("spec", {}).get("targetRefs") == [{"group":"gateway.networking.k8s.io", "kind":"Gateway", "name":os.environ["GATEWAY_API_NAME"]}], p.get("spec")
+else:
+    assert p.get("spec", {}).get("selector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "zone-gateway", p.get("spec")
 '
 }
+
+gateway_principal() { printf 'poc.example/ns/%s/sa/%s' "$1" "$GATEWAY_SERVICE_ACCOUNT"; }
 
 wait_dynamic_policy_empty() {
   local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
@@ -446,15 +473,19 @@ assert json.load(sys.stdin).get("spec", {}).get("rules") == []
 wait_dynamic_policy_allows_a_to_b() {
   local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
   while (( SECONDS < deadline )); do
-    if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json 2>/dev/null | python3 -c '
-import json,sys
-rules=json.load(sys.stdin).get("spec", {}).get("rules", [])
+    if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json 2>/dev/null | MODE="$MODE" GATEWAY_API_NAME="$GATEWAY_API_NAME" EXPECTED_PRINCIPAL="$(gateway_principal "$ZONE_A")" python3 -c '
+import json,os,sys
+p=json.load(sys.stdin)
+spec=p.get("spec", {})
+rules=spec.get("rules", [])
 assert all("8080" not in target.get("operation", {}).get("ports", []) for rule in rules for target in rule.get("to", []))
 assert any(
-    "poc.example/ns/zone-a/sa/zone-gateway" in source.get("source", {}).get("principals", [])
+    os.environ["EXPECTED_PRINCIPAL"] in source.get("source", {}).get("principals", [])
     and "8443" in target.get("operation", {}).get("ports", [])
     for rule in rules for source in rule.get("from", []) for target in rule.get("to", [])
 )
+if os.environ["MODE"] == "istio-gateway-api":
+    assert spec.get("targetRefs") == [{"group":"gateway.networking.k8s.io", "kind":"Gateway", "name":os.environ["GATEWAY_API_NAME"]}], spec
 ' 2>/dev/null; then
       return 0
     fi
@@ -537,7 +568,7 @@ pause_controller() {
 }
 
 test_istio_create_guard() {
-  [[ "$MODE" == istio ]] || return 0
+  is_istio_mode || return 0
   local as_controller="system:serviceaccount:$CONTROL_NAMESPACE:zone-trust-controller" rejection
   # Use POST (rather than apply's PATCH) to exercise the recovery CREATE
   # permission directly. RBAC deliberately grants this verb, so a successful
@@ -612,7 +643,7 @@ EOF
 }
 
 test_istio_dynamic_policy_recreation_fail_closed() {
-  [[ "$MODE" == istio ]] || return 0
+  is_istio_mode || return 0
   local runtime_before before after
   runtime_before=$(workload_fingerprint) || return 1
 
@@ -699,6 +730,14 @@ test_allow() {
   before=$(app_requests "$ZONE_B") || return 1
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-allow) || return 1
   is_successful_response "$output" || { printf '%s\n' "$output" >&2; return 1; }
+  if is_gateway_api_mode; then
+    printf '%s\n' "$output" | request_body | python3 -c '
+import json,sys
+body=json.load(sys.stdin)
+assert body.get("zone") == sys.argv[1], body
+assert body.get("path") == "/e2e-allow", body
+' "$ZONE_B" || return 1
+  fi
   after=$(app_requests "$ZONE_B") || return 1
   [[ "$after" -gt "$before" ]] || fail "allowed request did not reach $ZONE_B app"
   assert_workloads_unchanged "$runtime_before"
@@ -709,20 +748,20 @@ test_deleted_edge_deny() {
   runtime_before=$(workload_fingerprint) || return 1
   kubectl delete zonetrust "$(edge_name "$ZONE_A" "$ZONE_B")" >/dev/null || return 1
   printf 'deleted fixture edge: %s\n' "$(edge_name "$ZONE_A" "$ZONE_B")" >>"$STATE_DIR/actions.log" || return 1
-  if [[ "$MODE" == istio ]]; then
+  if is_istio_mode; then
     # First prove the generated API policy no longer contains the deleted
     # principal. The data-plane helper below then requires a stable series of
     # RBAC 403s; a lone 403 can be an older xDS snapshot while a previous allow
     # update is still in flight.
     local deadline=$((SECONDS + CONVERGENCE_TIMEOUT))
     while (( SECONDS < deadline )); do
-      if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json | python3 -c '
-import json,sys
+      if kubectl -n "$ZONE_B" get authorizationpolicy zone-trust-generated -o json | EXPECTED_PRINCIPAL="$(gateway_principal "$ZONE_A")" python3 -c '
+import json,os,sys
 policy=json.load(sys.stdin)
 for rule in policy.get("spec", {}).get("rules", []):
     for source in rule.get("from", []):
         principals=source.get("source", {}).get("principals", [])
-        assert "poc.example/ns/zone-a/sa/zone-gateway" not in principals
+        assert os.environ["EXPECTED_PRINCIPAL"] not in principals
     for target in rule.get("to", []):
         ports=target.get("operation", {}).get("ports", [])
         assert "8443" not in ports
@@ -796,6 +835,40 @@ test_wrong_workload() {
   [[ "$before" == "$after" ]] || fail "workload without gateway identity reached $ZONE_B app"
 }
 
+test_gateway_api_rejects_missing_client_certificate() {
+  is_gateway_api_mode || return 0
+  local ca_file pod local_port transcript
+  ca_file=$(mktemp "${TMPDIR:-/tmp}/spire-gateway-api-public-ca.XXXXXX") || return 1
+  # The test deliberately trusts only SPIRE's public bundle.  Do not use
+  # --insecure or a host trust store: those would make a TLS alert ambiguous
+  # between an untrusted server and the required client-certificate rejection.
+  if ! kubectl -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -format pem \
+    -socketPath /tmp/spire-server/private/api.sock >"$ca_file"; then
+    rm -f "$ca_file"
+    return 1
+  fi
+  pod=$(kubectl -n "$ZONE_B" get pod -l app.kubernetes.io/component=zone-gateway,security.poc.example/zone="$ZONE_B",spiffe.io/spire-managed-identity=true -o jsonpath='{.items[0].metadata.name}') || { rm -f "$ca_file"; return 1; }
+  if ! start_port_forward local_port "$ZONE_B" "pod/$pod" 8443; then
+    rm -f "$ca_file"
+    return 1
+  fi
+  # Never emit this transcript: OpenSSL may include public certificate detail
+  # on a failed handshake. We only classify the verification result and alert.
+  transcript=$(timeout 15s openssl s_client -verify_return_error \
+    -no-CApath -no-CAstore -CAfile "$ca_file" -connect "127.0.0.1:$local_port" \
+    -servername "${GATEWAY_SERVICE}.${ZONE_B}.svc.cluster.local" </dev/null 2>&1 || true)
+  rm -f "$ca_file"
+  if [[ "$transcript" != *'Verify return code: 0 (ok)'* ]]; then
+    fail "Gateway API protected listener server chain did not validate against the public SPIRE bundle"
+    return 1
+  fi
+  if [[ "$transcript" != *'certificate required'* && "$transcript" != *'Certificate Required'* && "$transcript" != *'peer did not return a certificate'* ]]; then
+    fail "Gateway API protected listener did not reject a client with no certificate"
+    return 1
+  fi
+}
+
 test_direct_app_bypass() {
   local before output after
   before=$(app_requests "$ZONE_B") || return 1
@@ -864,7 +937,7 @@ test_controller_outage_and_recovery() {
     return 1
   fi
   reverse_output=$(gateway_call "$ZONE_B" "$ZONE_A" /e2e-controller-outage-reverse) || true
-  if [[ "$MODE" == istio ]]; then
+  if is_istio_mode; then
     is_forbidden_response "$reverse_output" || { response_summary "$reverse_output" >&2; restore_controller_after_outage || true; return 1; }
   else
     is_denied_response "$reverse_output" || { response_summary "$reverse_output" >&2; restore_controller_after_outage || true; return 1; }
@@ -915,12 +988,12 @@ for c in items:
         uris.append(san.removeprefix("URI:"))
       elif isinstance(san, dict) and isinstance(san.get("uri"), str):
         uris.append(san["uri"])
-    expected=f"spiffe://poc.example/ns/{sys.argv[1]}/sa/zone-gateway"
+    expected=f"spiffe://poc.example/ns/{sys.argv[1]}/sa/{sys.argv[2]}"
     if serial and expiry and expected in uris:
       print(f"{serial} {expiry}")
       raise SystemExit(0)
 raise SystemExit("no serial/expiry in Envoy admin certificate response")
-' "$zone"
+' "$zone" "$GATEWAY_SERVICE_ACCOUNT"
 }
 
 # A local port-forward can close independently of the running gateway (for
@@ -981,6 +1054,12 @@ test_svid_rotation() {
   local before after output admin_port deadline runtime_before
   runtime_before=$(workload_fingerprint) || return 1
   set_edge "$ZONE_A" "$ZONE_B" true >/dev/null || return 1
+  if is_gateway_api_mode; then
+    # Verify the entire current public chain and the actual generated
+    # ServiceAccount URI before recording only serial/expiry metadata for the
+    # renewal comparison. The verifier never prints or retains private keys.
+    "$ROOT/scripts/verify-svids.sh" "$MODE" | tee "$STATE_DIR/svid-verify-before.txt" || return 1
+  fi
   gateway_admin_port admin_port "$ZONE_A" || return 1
   read_gateway_certificate_metadata before "$ZONE_A" admin_port || return 1
   printf 'before: %s\n' "$before" >"$STATE_DIR/svid-rotation.txt" || return 1
@@ -998,6 +1077,9 @@ test_svid_rotation() {
     return 1
   fi
   printf 'after: %s\n' "$after" >>"$STATE_DIR/svid-rotation.txt" || return 1
+  if is_gateway_api_mode; then
+    "$ROOT/scripts/verify-svids.sh" "$MODE" | tee "$STATE_DIR/svid-verify-after.txt" || return 1
+  fi
   output=$(gateway_call "$ZONE_A" "$ZONE_B" /e2e-svid-rotation) || return 1
   is_successful_response "$output" || return 1
   assert_workloads_unchanged "$runtime_before"
@@ -1029,7 +1111,7 @@ import json,sys
 p=json.load(sys.stdin)
 s=p["spec"]
 assert any(v.get("csi",{}).get("driver") == "csi.spiffe.io" for v in s.get("volumes", [])), s.get("volumes")
-if __import__("os").environ.get("MODE") == "istio":
+if __import__("os").environ.get("MODE") in ("istio", "istio-gateway-api"):
     # The custom gateway injection template intentionally replaces the
     # application container with one Envoy gateway proxy.  Checking the live
     # rendered Pod catches a silently skipped injection (which otherwise
@@ -1048,7 +1130,12 @@ if __import__("os").environ.get("MODE") == "istio":
     gateway_admin_port admin_port "$zone" || return 1
     admin_certificate_metadata "$admin_port" "$zone" >/dev/null || return 1
   done
-  kubectl get clusterspiffeid zone-gateway >/dev/null || return 1
+  if is_gateway_api_mode; then
+    kubectl get clusterspiffeid zone-gateway-api >/dev/null || return 1
+    "$ROOT/scripts/check-gateway-api.sh" | tee "$STATE_DIR/gateway-api-structure.txt" || return 1
+  else
+    kubectl get clusterspiffeid zone-gateway >/dev/null || return 1
+  fi
   secret_private_key_count=$(kubectl get secret -A -o json | python3 -c 'import json,sys; print(sum(1 for x in json.load(sys.stdin)["items"] if "gateway" in x["metadata"]["name"] and any(k.lower().endswith(("key","key.pem")) for k in x.get("data",{}))))') || return 1
   [[ "$secret_private_key_count" == 0 ]] || return 1
   if [[ "$MODE" == standalone ]]; then
@@ -1130,7 +1217,7 @@ main() {
   run_case 'default deny keeps destination counter unchanged' test_default_deny
   run_case 'allow A -> B reaches destination app' test_allow
   run_case 'structural invariants' test_structure
-  if [[ "$MODE" == istio ]]; then
+  if is_istio_mode; then
     run_case 'Istio policy create guard blocks baseline weakening' test_istio_create_guard
     run_case 'Istio dynamic policy deletion fails closed and controller recreates it' test_istio_dynamic_policy_recreation_fail_closed
   fi
@@ -1139,6 +1226,9 @@ main() {
   run_case 'live deny and restore allow without workload restart' test_live_toggle
   run_case 'spoofed protected identity headers are removed before app' test_spoof_header
   run_case 'non-gateway workload cannot enter protected 8443' test_wrong_workload
+  if is_gateway_api_mode; then
+    run_case 'Gateway API protected listener rejects no-client-cert TLS with SPIRE CA validation' test_gateway_api_rejects_missing_client_certificate
+  fi
   run_case 'NetworkPolicy blocks direct zone-a -> zone-b app bypass' test_direct_app_bypass
   run_case 'controller outage and recovery match backend failure semantics' test_controller_outage_and_recovery
   run_case 'gateway SVID refresh exposes new public metadata and recovers traffic' test_svid_rotation

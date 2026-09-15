@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [standalone, istio]
+        mode: [standalone, istio, istio-gateway-api]
     env:
       MODE: ${{ matrix.mode }}
     steps:

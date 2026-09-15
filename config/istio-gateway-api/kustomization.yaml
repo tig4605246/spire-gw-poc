@@ -1,0 +1,8 @@
+resources:
+  - gateways.yaml
+  - gateway-options.yaml
+  - http-routes.yaml
+  - reference-grants.yaml
+  - destination-rules.yaml
+  - default-authorization-policies.yaml
+  - gateway-clusterspiffeid.yaml

@@ -1,0 +1,14 @@
+resources:
+  - ../../config/rbac
+  - ../../config/controller
+  - ../../config/common
+  - ../../config/istio-gateway-api
+patches:
+  - target:
+      kind: Deployment
+      name: zone-trust-controller
+      namespace: control-plane
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: istio-gateway-api
