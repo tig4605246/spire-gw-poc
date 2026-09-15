@@ -43,7 +43,7 @@ not add another proxy container or depend on injection for the CSI mount.
 
 The generated template contains an `emptyDir` volume named `workload-socket`
 and a mount at `/var/run/secrets/workload-spiffe-uds`. The SPIRE integration
-sample replaces the volume with the CSI driver, changes the mount to
+sample changes the volume to use the CSI driver, changes the mount to
 `/run/secrets/workload-spiffe-uds`, and adds an init container that waits for
 `socket`. An automated Gateway must make the same changes through its
 `deployment` overlay.
@@ -51,7 +51,12 @@ sample replaces the volume with the CSI driver, changes the mount to
 Kubernetes strategic merge uses different list keys here: `containers` and
 `volumes` merge by `name`, but `volumeMounts` merge by `mountPath`. The patch
 must delete the original mount by its old `mountPath` before it adds the new
-mount. A representative ConfigMap entry is:
+mount. Do not use `$patch: replace` on the `workload-socket` volume entry. A
+list-level replace directive replaces the whole `volumes` list. That removes
+Istio's other required volumes and makes the generated Deployment invalid.
+Merge the entry by `name`, set `emptyDir` to `null`, and add the CSI source.
+
+A representative ConfigMap entry is:
 
 ```yaml
 data:
@@ -77,7 +82,7 @@ data:
               readOnly: true
           volumes:
           - name: workload-socket
-            $patch: replace
+            emptyDir: null
             csi:
               driver: csi.spiffe.io
               readOnly: true
@@ -95,7 +100,7 @@ The init container proves that the socket is present before Envoy starts. It
 does not prove that SPIRE issued an SVID. The bootstrap and e2e checks must
 also verify the actual SVID, URI SAN, and protected traffic.
 
-Sources: [Istio 1.31 generated deployment fixture](https://github.com/istio/istio/blob/1.31.0/pilot/pkg/config/kube/gatewaycommon/testdata/deployment/simple.yaml), [Istio 1.31 SPIRE sample](https://github.com/istio/istio/blob/1.31.0/samples/security/spire/istio-spire-config.yaml), [Kubernetes strategic merge patch reference](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/update-api-object-kubectl-patch/), [Kubernetes `VolumeMount` patch key](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/api/core/v1/types.go#L3005-L3011).
+Sources: [Istio 1.31 generated deployment fixture](https://github.com/istio/istio/blob/1.31.0/pilot/pkg/config/kube/gatewaycommon/testdata/deployment/simple.yaml), [Istio 1.31 SPIRE sample](https://github.com/istio/istio/blob/1.31.0/samples/security/spire/istio-spire-config.yaml), [Kubernetes strategic merge patch reference](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/update-api-object-kubectl-patch/), [Kubernetes strategic merge list directives](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-api-machinery/strategic-merge-patch.md), [Kubernetes `VolumeMount` patch key](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/api/core/v1/types.go#L3005-L3011), [Kubernetes `Volume` patch key](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/api/core/v1/types.go#L4089-L4095).
 
 ## SPIRE identity
 
