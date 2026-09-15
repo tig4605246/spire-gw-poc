@@ -1133,6 +1133,7 @@ if __import__("os").environ.get("MODE") in ("istio", "istio-gateway-api"):
   if is_gateway_api_mode; then
     kubectl get clusterspiffeid zone-gateway-api >/dev/null || return 1
     "$ROOT/scripts/check-gateway-api.sh" | tee "$STATE_DIR/gateway-api-structure.txt" || return 1
+    "$ISTIOCTL" analyze --all-namespaces --failure-threshold Error --output json >"$STATE_DIR/istio-analyze.json" || return 1
   else
     kubectl get clusterspiffeid zone-gateway >/dev/null || return 1
   fi
