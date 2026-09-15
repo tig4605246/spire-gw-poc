@@ -276,7 +276,7 @@ Suggested commit: `feat: add Istio-managed SPIRE zone gateways`
 
 ## 9. Work package 7 — e2e and evidence
 
-Use one table-driven `scripts/e2e.sh` for both modes. It should create temporary port-forwards with cleanup traps or use a dedicated test Pod. Never depend on a developer's pre-existing port-forward.
+Use one table-driven `scripts/e2e.sh` for all three modes. Create temporary port-forwards with cleanup traps or use a dedicated test Pod. Never depend on a developer's pre-existing port-forward.
 
 ### 9.1 Functional matrix
 
@@ -344,7 +344,7 @@ Suggested commit: `docs: add operations guide and verified trade-offs`
 
 Implementation is complete only when all are true:
 
-- fresh checkout to both passing modes is automated;
+- fresh checkout to all three passing modes is automated;
 - dashboard toggles mutate real `ZoneTrust` objects;
 - applied status corresponds to effective ext-authz or Istio policy state;
 - traffic behavior changes without gateway/app restart;
@@ -352,7 +352,7 @@ Implementation is complete only when all are true:
 - gateway SVIDs come from SPIRE Agent SDS and rotate;
 - apps are plain HTTP and SPIFFE-unaware by manifest and runtime inspection;
 - NetworkPolicy direct-bypass test passes under the installed CNI;
-- docs contain reproducible evidence for both modes;
+- docs contain reproducible evidence for all three modes;
 - CI is green and the PR clearly lists remaining non-production limitations.
 
 ## 12. Review hotspots
@@ -369,3 +369,19 @@ Review these areas as security-sensitive:
 8. NetworkPolicy enforcement by the selected CNI;
 9. lack of app sidecars and direct-app bypass;
 10. secrets/logs/test artifacts for accidental private key material.
+
+## 13. Scheme C implementation
+
+Issue #2 adds `MODE=istio-gateway-api` while preserving the A/B deployment resources and commands.
+
+1. Pin the standard Gateway API bundle in `versions.env` and install it before Istiod.
+2. Add `config/istio-gateway-api` and its deployment overlay. Use automated provisioning with a namespace-local customization ConfigMap.
+3. Add an independent ClusterSPIFFEID that derives the identity from the actual Pod ServiceAccount.
+4. Add HTTPRoutes, restricted ReferenceGrants, outbound DestinationRules, and the independent targetRef baseline.
+5. Add `internal/istio_gateway_api` with separate renderer, ownership checks, SSA, and exact readback.
+6. Extend the CLI, certificate verifier, structural checks, and dashboard API tests to the third mode.
+7. Run all three acceptance suites. Scheme C also checks Gateway/Route conditions and generated resource ownership.
+8. Record live results, certificate rotation, deletion recovery, and convergence in `docs/test-evidence.md`.
+9. Submit a PR with the three-mode commands, evidence, and B/C trade-offs.
+
+The deployment helper rejects stale condition generations and unexpected ServiceAccount names. The certificate verifier requires the exact URI and a valid chain against the SPIRE bundle. Tests require denied traffic to leave the destination counter unchanged. CI runs each mode in a separate fresh cluster.
