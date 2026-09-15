@@ -7,8 +7,8 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 source "$script_dir/lib/verify-svid-chain.sh"
 mode="${MODE:-${1:-}}"
 case "$mode" in
-  standalone|istio) gateway_service_account=zone-gateway ;;
-  istio-gateway-api) gateway_service_account=zone-gateway-istio ;;
+  standalone|istio) gateway_service_account="zone-gateway" ;;
+  istio-gateway-api) gateway_service_account="zone-gateway-istio" ;;
   *) printf 'usage: %s standalone|istio|istio-gateway-api\n' "$0" >&2; exit 2 ;;
 esac
 export KUBECONFIG="${KUBECONFIG:-$repo_root/.state/$mode/kubeconfig}"

@@ -45,8 +45,11 @@ def check(resources):
         sa = one("ServiceAccount", zone, account)
         accounts[zone] = account
         for obj in (deployment, service, sa):
+            # Istio's generated owner references omit the optional controller
+            # bit. Identity is the exact Gateway UID, API, kind, and name.
             assert any(r.get("uid") == gateway["metadata"]["uid"]
-                       and r.get("kind") == "Gateway" and r.get("controller") is True
+                       and r.get("apiVersion") == "gateway.networking.k8s.io/v1"
+                       and r.get("kind") == "Gateway" and r.get("name") == "zone-gateway"
                        for r in obj["metadata"].get("ownerReferences", [])), (zone, obj["kind"], "not Gateway-owned")
         assert deployment["spec"]["replicas"] == 1, (zone, "expected single replica")
         status = deployment.get("status", {})
