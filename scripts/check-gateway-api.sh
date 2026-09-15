@@ -18,4 +18,8 @@ cat "$check_dir/error" >&2
 kubectl get gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io -A -o yaml >&2 || true
 kubectl get pods -A -o wide >&2 || true
 kubectl get events -A --sort-by=.lastTimestamp >&2 || true
+# Accepted=True is set by a different controller from automatic deployment.
+# Include its leadership and logs when no generated workload appears.
+kubectl -n istio-system get leases -o wide >&2 || true
+kubectl -n istio-system logs deployment/istiod --tail=300 >&2 || true
 exit 1
