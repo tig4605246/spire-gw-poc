@@ -4,7 +4,7 @@
 
 The POC demonstrates dynamic, directional trust between at least two logical zones in one kind cluster. An operator changes a trust edge in a dashboard; that action updates a Kubernetes custom resource; the running data plane begins allowing or denying the affected cross-zone request without rebuilding an image or editing a static manifest.
 
-The POC compares two implementations while holding the application-facing contract constant.
+The POC compares three implementations while holding the application-facing contract constant.
 
 In scope:
 
@@ -61,6 +61,8 @@ k8s:sa:zone-gateway
 ```
 
 The application service accounts have no SPIRE registration and no CSI volume.
+
+Scheme C uses `sa/zone-gateway-istio`, the ServiceAccount generated for each Kubernetes Gateway. Its independent ClusterSPIFFEID derives both the URI and workload selector from the actual Pod ServiceAccount. Bootstrap checks the generated ownership, account, and certificate URI against the policy expectations. Schemes A and B retain their existing registration.
 
 ### 3.2 "Zone trust" is authorization, not bundle federation
 
@@ -323,6 +325,29 @@ Gateway access logs include source SPIFFE ID, destination zone, response code, r
 | Debugging | Envoy config/logs + controller snapshot | Kubernetes resources + Istiod + Envoy proxy state |
 | Best fit | Small gateway-only deployments and transparent control | Existing Istio operations, richer traffic/policy needs |
 | VM path | Natural: Envoy + SPIRE Agent on VM | Supported but requires Istio VM onboarding/control-plane reachability |
+
+### 10.1 Scheme C: Istio with Kubernetes Gateway API
+
+Mode `istio-gateway-api` adds an independent `spire-gw-istio-gateway-api` cluster. It installs the pinned standard Gateway API CRDs before Istiod and Gateway creation. Istio uses the existing minimal profile.
+
+Each zone has one `gateway.networking.k8s.io/v1` Gateway named `zone-gateway`. Istio generates the `zone-gateway-istio` Deployment, Service, and ServiceAccount. A local ConfigMap provides explicit network labels, one replica, zone scheduling, and the SPIRE CSI mount. An init container waits for the socket. The standard proxy readiness check and served SVID verification gate bootstrap completion.
+
+The 8080 HTTPRoute removes `/call/<destination>` and forwards to the destination Gateway Service on 8443. A namespace-specific ReferenceGrant permits only that Service. The 8443 HTTPRoute removes protected identity headers and forwards plain HTTP to the local app. Both routes remove caller-supplied trust headers. The Gateway TLS extension and DestinationRule use `ISTIO_MUTUAL`; the DestinationRule requires the exact destination URI.
+
+The baseline and generated AuthorizationPolicies both target the local Gateway through `targetRefs`. The baseline allows only 8080. The generated policy permits allowed source principals on 8443 or has an empty rule list. The controller uses SSA, rejects ownership collisions, and checks the observed policy before advancing Applied status. Its status backend is `istio-gateway-api-authorization-policy`.
+
+The explicit Pod labels retain the common NetworkPolicy contract. Apps receive no sidecar, CSI socket, certificate, or SPIFFE library. Bootstrap checks current Gateway and HTTPRoute conditions, resource ownership, the actual ServiceAccount, and the served SVID chain.
+
+| Dimension | B: Istio APIs | C: Kubernetes Gateway API |
+| --- | --- | --- |
+| Traffic API | Gateway + VirtualService | Gateway + HTTPRoute |
+| Resource lifecycle | Explicit Deployment/Service | Automated provisioning |
+| Authorization attachment | Pod selector | Gateway targetRefs |
+| Cross-namespace reference | Istio host | backendRef + ReferenceGrant |
+| Istio extensions | Gateway, VirtualService, DestinationRule | ISTIO_MUTUAL option and DestinationRule |
+| Portability | Istio-specific | Portable routing API, Istio-specific identity/TLS integration |
+
+[ADR 0006](adr/0006-istio-gateway-api.md) records these choices. [Pinned research](gateway-api-research.md) links their official sources.
 
 ## 11. Known limitations to state in the final POC
 

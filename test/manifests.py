@@ -26,13 +26,14 @@ for path in sorted(ROOT.glob("config/**/*.yaml")):
     if "template" not in path.name:
         list(yaml.load_all(path.read_text(), Loader=UniqueLoader))
 
-for mode in ("standalone", "istio"):
+for mode in ("standalone", "istio", "istio-gateway-api"):
     rendered = subprocess.check_output(["kubectl", "kustomize", str(ROOT / "deploy" / mode)], text=True)
     objects = [o for o in yaml.load_all(rendered, Loader=UniqueLoader) if o]
     deployments = [o for o in objects if o["kind"] == "Deployment"]
     for zone in ("zone-a", "zone-b"):
         local = [o for o in deployments if o["metadata"].get("namespace") == zone]
-        assert {o["metadata"]["name"] for o in local} == {"zone-app", "zone-gateway"}, local
+        expected_deployments = {"zone-app"} if mode == "istio-gateway-api" else {"zone-app", "zone-gateway"}
+        assert {o["metadata"]["name"] for o in local} == expected_deployments, local
         app = next(o for o in local if o["metadata"]["name"] == "zone-app")["spec"]["template"]
         assert app["metadata"]["annotations"]["sidecar.istio.io/inject"] == "false"
         assert len(app["spec"]["containers"]) == 1
@@ -59,7 +60,7 @@ for mode in ("standalone", "istio"):
             elif container["name"] == "controller":
                 assert container["image"] == PINS["CONTROLLER_IMAGE"], "Controller pin drift"
     assert not any(o["kind"] == "Secret" for o in objects), "Gateway manifests must not carry keys"
-    if mode == "istio":
+    if mode in ("istio", "istio-gateway-api"):
         rules = [o for o in objects if o["kind"] == "DestinationRule"]
         assert {o["metadata"]["name"] for o in rules} == {"zone-a-gateway-mtls", "zone-b-gateway-mtls"}
         for rule in rules:
@@ -97,4 +98,65 @@ for mode in ("standalone", "istio"):
         assert binding["spec"]["policyName"] == vap["metadata"]["name"]
         assert binding["spec"]["validationActions"] == ["Deny"]
         assert binding["spec"]["matchResources"]["namespaceSelector"]["matchLabels"] == {"security.poc.example/zone": "true"}
+
+    if mode == "istio-gateway-api":
+        # Gateway API owns the data-plane Deployment/Service/ServiceAccount at
+        # runtime.  The overlay must therefore contain no hand-authored
+        # gateway workload, while every object that binds that generated
+        # workload remains exact and zone-scoped.
+        assert not any(o["kind"] == "Deployment" and o["metadata"]["name"] == "zone-gateway-istio" for o in objects)
+        gateways = [o for o in objects if o["kind"] == "Gateway"]
+        assert {(o["metadata"]["namespace"], o["metadata"]["name"]) for o in gateways} == {
+            ("zone-a", "zone-gateway"), ("zone-b", "zone-gateway"),
+        }
+        for gateway in gateways:
+            spec = gateway["spec"]
+            assert spec["gatewayClassName"] == "istio"
+            assert spec["infrastructure"]["parametersRef"] == {
+                "group": "", "kind": "ConfigMap", "name": "zone-gateway-options",
+            }
+            listeners = {item["name"]: item for item in spec["listeners"]}
+            assert listeners["http-call-entry"]["port"] == 8080
+            assert listeners["https-protected"]["port"] == 8443
+            assert listeners["https-protected"]["tls"] == {
+                "mode": "Terminate",
+                "options": {"gateway.istio.io/tls-terminate-mode": "ISTIO_MUTUAL"},
+            }
+        options = [o for o in objects if o["kind"] == "ConfigMap" and o["metadata"]["name"] == "zone-gateway-options"]
+        assert {o["metadata"]["namespace"] for o in options} == {"zone-a", "zone-b"}
+        for option in options:
+            deployment_patch = yaml.load(option["data"]["deployment"], Loader=UniqueLoader)
+            service_patch = yaml.load(option["data"]["service"], Loader=UniqueLoader)
+            labels = deployment_patch["spec"]["template"]["metadata"]["labels"]
+            assert deployment_patch["spec"]["replicas"] == 1
+            assert service_patch["spec"]["type"] == "ClusterIP"
+            assert labels["app.kubernetes.io/component"] == "zone-gateway"
+            assert labels["spiffe.io/spire-managed-identity"] == "true"
+            assert labels["gateway.networking.k8s.io/gateway-name"] == "zone-gateway"
+        policies = [o for o in objects if o["kind"] == "AuthorizationPolicy"]
+        assert {p["metadata"]["name"] for p in policies} == {"zone-trust-baseline"}
+        for policy in policies:
+            assert "selector" not in policy["spec"]
+            assert policy["spec"]["targetRefs"] == [{
+                "group": "gateway.networking.k8s.io", "kind": "Gateway", "name": "zone-gateway",
+            }]
+            assert policy["spec"]["rules"] == [{"to": [{"operation": {"ports": ["8080"]}}]}]
+        spiffe_ids = [o for o in objects if o["kind"] == "ClusterSPIFFEID"]
+        assert [o["metadata"]["name"] for o in spiffe_ids] == ["zone-gateway-api"]
+        spiffe = spiffe_ids[0]["spec"]
+        assert spiffe["spiffeIDTemplate"] == "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}"
+        assert spiffe["podSelector"]["matchLabels"] == {
+            "app.kubernetes.io/component": "zone-gateway",
+            "spiffe.io/spire-managed-identity": "true",
+            "gateway.networking.k8s.io/gateway-name": "zone-gateway",
+        }
+        routes = [o for o in objects if o["kind"] == "HTTPRoute"]
+        assert {(o["metadata"]["namespace"], o["metadata"]["name"]) for o in routes} == {
+            ("zone-a", "call-remote-zone"), ("zone-a", "protected-local-app"),
+            ("zone-b", "call-remote-zone"), ("zone-b", "protected-local-app"),
+        }
+        grants = [o for o in objects if o["kind"] == "ReferenceGrant"]
+        assert {o["metadata"]["namespace"] for o in grants} == {"zone-a", "zone-b"}
+        for grant in grants:
+            assert grant["spec"]["to"] == [{"group": "", "kind": "Service", "name": "zone-gateway-istio"}]
     print(f"PASS {mode}: YAML, overlays, plain apps, deny isolation, image tags, no key Secrets")

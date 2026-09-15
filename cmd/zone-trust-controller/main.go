@@ -17,6 +17,7 @@ import (
 	"github.com/tig4605246/spire-gw-poc/internal/authz"
 	"github.com/tig4605246/spire-gw-poc/internal/controller"
 	"github.com/tig4605246/spire-gw-poc/internal/istio"
+	istiogatewayapi "github.com/tig4605246/spire-gw-poc/internal/istio_gateway_api"
 	"github.com/tig4605246/spire-gw-poc/internal/ui"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,8 +39,8 @@ func run() error {
 	if backend == "" {
 		backend = controller.BackendStandalone
 	}
-	if backend != controller.BackendStandalone && backend != controller.BackendIstio {
-		return fmt.Errorf("POLICY_BACKEND must be standalone or istio")
+	if backend != controller.BackendStandalone && backend != controller.BackendIstio && backend != controller.BackendIstioGatewayAPI {
+		return fmt.Errorf("POLICY_BACKEND must be standalone, istio, or istio-gateway-api")
 	}
 	config, err := ctrl.GetConfig()
 	if err != nil {
@@ -64,7 +65,7 @@ func run() error {
 	metrics := controller.NewMetrics(registry)
 	store := authz.NewStore(30 * time.Second)
 	server := api.NewServer(direct, store, ui.Handler(), metrics)
-	reconciler := &controller.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Backend: backend, Store: store, Istio: istio.Applicator{Client: direct}, Events: server, Metrics: metrics}
+	reconciler := &controller.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Backend: backend, Store: store, Istio: istio.Applicator{Client: direct}, IstioGatewayAPI: istiogatewayapi.Applicator{Client: direct}, Events: server, Metrics: metrics}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return err
 	}
