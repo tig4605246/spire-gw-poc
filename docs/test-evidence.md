@@ -95,13 +95,53 @@ The [dashboard screenshot](images/dashboard.png) shows the live controller state
 
 ## GitHub CI
 
-The [workflow](../.github/workflows/ci.yaml) runs unit, race, generation, manifest, Envoy, multi-architecture build, and both cluster suites. The [Actions history](https://github.com/tig4605246/spire-gw-poc/actions/workflows/ci.yaml) contains the independent runner results and downloadable e2e evidence.
+The [workflow](../.github/workflows/ci.yaml) runs unit, race, generation, manifest, Envoy, multi-architecture build, and all three cluster suites. The [Actions history](https://github.com/tig4605246/spire-gw-poc/actions/workflows/ci.yaml) contains the independent runner results and downloadable e2e evidence.
 
 The first runner check job passed. Its bootstrap jobs exposed a missing `rg` utility on the runner. The bootstrap now uses standard `grep` for that fixed-string assertion.
 
 Later runners exposed an Istio test race after policy changes. A focused local reproduction observed transient 403 responses after an initial successful allow probe. Every successful spoof response had the protected headers removed. The harness now separates traffic convergence from its strict header, denial, and app-counter assertions. Final runner status is available in the linked Actions history.
 
 An independent runner also exposed intermittent Istio denials during controller outage. The local reproduction kept the same AuthorizationPolicy resource version and correct peer SPIFFE identity. Disabling source-gateway connection reuse produced eight successful requests out of eight. Restoring reuse produced three denials out of eight. Both inter-gateway DestinationRules now limit each connection to one request. The outage test checks eight requests, not one. [ADR 0004](adr/0004-bound-istio-gateway-connections.md) records the evidence and performance trade-off.
+
+## Gateway API addition: September 2026
+
+The local host ran `make test` successfully after the Gateway API changes. This includes Go unit, race, and vet checks, shell harness checks, certificate-chain negative cases, current-generation condition checks, and all three manifest overlays. A new Go test applies the real ConfigMap customization with Kubernetes strategic merge. It verifies that the SPIRE socket change preserves Istio's other volumes and mounts.
+
+The initial customization used `$patch: replace` inside the volumes list. Live Istiod logs showed that the generated Deployment lost its required volumes. The corrected patch merges `workload-socket` by name and removes only its `emptyDir` source. Both generated Deployments were accepted after this change. The regression test rejects the original patch.
+
+The local standalone regression passed 12/12 cases. Artifacts are in `.state/standalone/evidence/20260915T235629-3601467/`. Desired-to-applied p50/p95 were 77/80 ms; applied-to-traffic p50/p95 were 60/64 ms.
+
+The local Istio regression could not finish bootstrap after three attempts. A GHCR connection reset prevented the worker's SPIFFE CSI image from downloading. This caused SPIRE rollout timeouts before e2e started. Independent [CI on the initial Gateway API branch](https://github.com/tig4605246/spire-gw-poc/actions/runs/34990197747) passed standalone 12/12 and Istio 14/14. Its Gateway API bootstrap failed; it is not a successful scheme C result.
+
+Local Gateway API bootstrap also needed retries for cold image downloads. The local investigation installed Istio and applied the Gateway resources separately to isolate the merge failure. Its later bootstrap therefore reused those resources. Fresh-cluster reproducibility is evaluated separately by CI.
+
+### Scheme C local acceptance
+
+On 2026-09-16 (Asia/Taipei), bootstrap completed and the full e2e suite passed **15/15**, with no skipped cases. Artifacts are in `.state/istio-gateway-api/evidence/20260916T000415-3652291/`. The host was Linux/amd64. The cluster used Kubernetes 1.34.11, kind 0.33.0, Cilium 1.19.0, SPIRE 1.15.3, Istio 1.31.0, and Gateway API 1.6.0 standard CRDs. The host's kubectl 1.36.1 reported unsupported client/server version skew; these results do not establish support for that skew.
+
+Both `zone-a/zone-gateway` and `zone-b/zone-gateway` had current-generation `Accepted=True` and `Programmed=True`. Each generated Deployment, Service, and ServiceAccount had an owner reference to the exact Gateway UID. Each zone had one Ready proxy Pod, with the specified node selection, labels, and read-only SPIRE CSI mount. All four HTTPRoutes had current-generation `Accepted=True` and `ResolvedRefs=True`.
+
+Both live ServiceAccounts were `zone-gateway-istio`. The served SVID URI SANs were exactly `spiffe://poc.example/ns/zone-a/sa/zone-gateway-istio` and `spiffe://poc.example/ns/zone-b/sa/zone-gateway-istio`. The verifier checked their complete chains against SPIRE's public bundle before and after rotation. It did not use the host CA store.
+
+The suite observed this zone-a renewal without changing Gateway or app Pod UIDs or restart counts:
+
+| Observation | Public leaf serial | Expiry (UTC) |
+| --- | --- | --- |
+| Before | `FFA71555922CE41DC53ABAF0F1C65713` | `2026-09-15T16:06:29Z` |
+| After | `080FDD9836CD9659EA4D42728A966965` | `2026-09-15T16:07:24Z` |
+
+All 20 timing samples used actual dashboard API changes and matching applied generations:
+
+| Interval | p50 | p95 | Samples |
+| --- | ---: | ---: | ---: |
+| API acceptance → applied status | 396 ms | 413 ms | 20 |
+| Applied status → observed traffic | 57 ms | 63 ms | 20 |
+
+The security cases verified independent directions, 403 denials with unchanged app counters, header removal, direct-app NetworkPolicy isolation, and plain HTTP apps. While the controller was stopped, accepted authorization remained active. Deleting the generated policy then produced denial through the independent targetRef baseline. The controller safely recreated its fixed-name policy after recovery. Attempts to modify the baseline or an arbitrary policy name were rejected.
+
+The no-client-certificate case trusted SPIRE's public bundle and observed the TLS `certificate required` alert. Its first version exited OpenSSL at stdin EOF before the TLS 1.3 alert arrived. The corrected probe uses `-ign_eof` with a timeout. Harness tests reject missing alerts and untrusted server chains.
+
+`istioctl analyze --all-namespaces --failure-threshold Error` passed. Its JSON contained only informational notices about uninjected namespaces, existing Service port names, and injection annotations. No analyzer errors or warnings were present.
 
 ## Interpretation and limitations
 
