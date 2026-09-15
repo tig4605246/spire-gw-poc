@@ -162,3 +162,64 @@ if assert_istio_baseline 2>"$TEMP_DIR/gateway-api-selector-rejection.log"; then
   exit 1
 fi
 printf 'e2e Gateway API targetRef and generated-principal regression tests passed\n'
+
+# The TLS negative test is only meaningful when the server chain is validated
+# against SPIRE's public bundle and the server has time to send its TLS 1.3
+# CertificateRequired alert.  Source the production helper and mock its I/O
+# boundary so this remains a fast regression test without certificate material.
+# shellcheck disable=SC1090 # Load only the production Gateway API TLS helper.
+source <(awk '
+  /^test_gateway_api_rejects_missing_client_certificate\(\)/ { emit=1 }
+  /^test_direct_app_bypass\(\)/ { exit }
+  emit { print }
+' "$ROOT/scripts/e2e.sh")
+MODE=istio-gateway-api
+ZONE_B=zone-b
+GATEWAY_SERVICE=zone-gateway-istio
+is_gateway_api_mode() { return 0; }
+mktemp() { printf '%s/no-client-cert-public-ca.pem\n' "$TEMP_DIR"; }
+kubectl() {
+  case "$*" in
+    *'bundle show -format pem'*) printf '%s\n' 'PUBLIC-SPIRE-BUNDLE-ONLY' ;;
+    *'get pod'*) printf '%s\n' 'gateway-pod' ;;
+    *) printf 'unexpected Gateway API TLS kubectl mock call: %s\n' "$*" >&2; return 1 ;;
+  esac
+}
+start_port_forward() {
+  local result_var=$1
+  printf -v "$result_var" '%s' 9443
+}
+timeout() {
+  local timeout_value=$1 executable=$2
+  shift 2
+  [[ "$timeout_value" == 15s && "$executable" == openssl ]] || return 1
+  printf '%s\n' "$@" >"$TEMP_DIR/no-client-cert-openssl-args"
+  printf '%b\n' "$MOCK_TLS_TRANSCRIPT"
+}
+fail() { return 1; }
+
+run_no_client_certificate_scenario() {
+  local scenario=$1 expected=$2
+  case "$scenario" in
+    valid-no-alert) MOCK_TLS_TRANSCRIPT='Verify return code: 0 (ok)\nDONE' ;;
+    untrusted-with-alert) MOCK_TLS_TRANSCRIPT='verify error:num=20\ntlsv13 alert certificate required' ;;
+    valid-with-alert) MOCK_TLS_TRANSCRIPT='Verify return code: 0 (ok)\ntlsv13 alert certificate required' ;;
+    *) return 2 ;;
+  esac
+  if test_gateway_api_rejects_missing_client_certificate >"$TEMP_DIR/no-client-cert-$scenario.log" 2>&1; then
+    [[ "$expected" == pass ]] || return 1
+  else
+    [[ "$expected" == fail ]] || return 1
+  fi
+}
+
+run_no_client_certificate_scenario valid-no-alert fail
+run_no_client_certificate_scenario untrusted-with-alert fail
+run_no_client_certificate_scenario valid-with-alert pass
+for argument in -ign_eof -verify_return_error -no-CApath -no-CAstore; do
+  grep -Fxq -- "$argument" "$TEMP_DIR/no-client-cert-openssl-args" || {
+    printf 'Gateway API TLS probe omitted required OpenSSL argument: %s\n' "$argument" >&2
+    exit 1
+  }
+done
+printf 'e2e Gateway API no-client-certificate TLS regression tests passed\n'
