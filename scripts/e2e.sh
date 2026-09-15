@@ -855,7 +855,9 @@ test_gateway_api_rejects_missing_client_certificate() {
   fi
   # Never emit this transcript: OpenSSL may include public certificate detail
   # on a failed handshake. We only classify the verification result and alert.
-  transcript=$(timeout 15s openssl s_client -verify_return_error \
+  # With TLS 1.3, EOF on stdin can close s_client before the server's client-
+  # certificate alert arrives. Keep reading until the alert or bounded timeout.
+  transcript=$(timeout 15s openssl s_client -ign_eof -verify_return_error \
     -no-CApath -no-CAstore -CAfile "$ca_file" -connect "127.0.0.1:$local_port" \
     -servername "${GATEWAY_SERVICE}.${ZONE_B}.svc.cluster.local" </dev/null 2>&1 || true)
   rm -f "$ca_file"
