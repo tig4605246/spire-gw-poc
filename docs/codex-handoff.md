@@ -6,12 +6,13 @@ Use this file as the starting context for the implementation task on another mac
 
 Implement the kind POC specified in [architecture.md](architecture.md), following the ordered work packages and definition of done in [implementation-plan.md](implementation-plan.md).
 
-Two independently deployable modes are required:
+Three independently deployable modes are required:
 
 1. `standalone`: one standalone Envoy gateway per zone, SPIRE Agent SDS for both client/server SVIDs, destination peer URI SAN extraction inside Envoy, and fail-closed ext-authz against the `ZoneTrust` controller.
 2. `istio`: one Istio-managed Envoy gateway per zone, SPIRE Agent SDS through the official Istio integration, and controller-generated Istio `AuthorizationPolicy` from the same `ZoneTrust` CRs.
+3. `istio-gateway-api`: Istio automatically provisions one Kubernetes Gateway per zone. HTTPRoutes control traffic, and controller-generated AuthorizationPolicies attach through Gateway `targetRefs`.
 
-In both modes the app is plain HTTP, has no sidecar/CSI/SPIFFE code, and is reachable cross-zone only through its local gateway.
+In all three modes the app is plain HTTP, has no sidecar/CSI/SPIFFE code, and is reachable cross-zone only through its local gateway.
 
 ## First actions
 
@@ -19,7 +20,7 @@ In both modes the app is plain HTTP, has no sidecar/CSI/SPIFFE code, and is reac
 2. Confirm current official component releases before changing pins. If newer versions are selected, explain compatibility and update the README/version file together.
 3. Check the branch/worktree and preserve unrelated changes.
 4. Implement work packages in order with focused commits.
-5. Run both complete bootstrap/e2e workflows on a clean cluster before opening the PR.
+5. Run all three complete bootstrap/e2e workflows on clean clusters before opening the PR.
 
 ## Non-negotiable choices
 
@@ -34,7 +35,7 @@ In both modes the app is plain HTTP, has no sidecar/CSI/SPIFFE code, and is reac
 
 ## Suggested implementation prompt
 
-> Implement this repository's SPIRE zone gateway POC. Treat `docs/architecture.md` as the architecture contract and `docs/implementation-plan.md` as the execution/acceptance plan. Complete both `standalone` and `istio` modes, run all feasible tests on clean kind clusters, make focused commits, push the feature branch, and open a PR to the default branch with architecture, commands, exact test evidence, and known limitations. If an upstream API differs from the design, verify current official documentation, record the decision in an ADR, and preserve the security invariants.
+> Maintain this repository's SPIRE zone gateway POC. Use `docs/architecture.md` and `docs/implementation-plan.md` as the architecture and acceptance contracts. Preserve `standalone`, `istio`, and `istio-gateway-api`. Run their tests on clean kind clusters and report exact evidence and known limitations. Record necessary architecture changes in an ADR.
 
 ## Official references to keep open
 

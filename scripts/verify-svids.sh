@@ -6,7 +6,11 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 # shellcheck disable=SC1091
 source "$script_dir/lib/verify-svid-chain.sh"
 mode="${MODE:-${1:-}}"
-case "$mode" in standalone|istio) ;; *) printf 'usage: %s standalone|istio\n' "$0" >&2; exit 2 ;; esac
+case "$mode" in
+  standalone|istio) gateway_service_account="zone-gateway" ;;
+  istio-gateway-api) gateway_service_account="zone-gateway-istio" ;;
+  *) printf 'usage: %s standalone|istio|istio-gateway-api\n' "$0" >&2; exit 2 ;;
+esac
 export KUBECONFIG="${KUBECONFIG:-$repo_root/.state/$mode/kubeconfig}"
 for command in kubectl openssl awk grep sed mktemp cat timeout seq sleep tr head mkdir cut rm date wc; do
   command -v "$command" >/dev/null || { printf 'missing required command: %s\n' "$command" >&2; exit 1; }
@@ -38,6 +42,11 @@ openssl crl2pkcs7 -nocrl -certfile "$bundle_file" | openssl pkcs7 -print_certs -
 for zone in zone-a zone-b; do
   pod="$(kubectl -n "$zone" get pod -l app.kubernetes.io/component=zone-gateway,spiffe.io/spire-managed-identity=true -o jsonpath='{.items[0].metadata.name}')"
   [[ -n "$pod" ]] || { printf 'no managed zone gateway pod found in %s\n' "$zone" >&2; exit 1; }
+  actual_service_account="$(kubectl -n "$zone" get pod "$pod" -o jsonpath='{.spec.serviceAccountName}')"
+  [[ "$actual_service_account" == "$gateway_service_account" ]] || {
+    printf 'gateway in %s uses ServiceAccount %s, expected %s\n' "$zone" "$actual_service_account" "$gateway_service_account" >&2
+    exit 1
+  }
   kubectl -n "$zone" get pod "$pod" -o jsonpath='{.spec.volumes[?(@.csi.driver=="csi.spiffe.io")].name}' | grep -q workload-socket
 
   pf_log="$temp_dir/$zone-port-forward.log"
@@ -92,7 +101,7 @@ for zone in zone-a zone-b; do
     ((chain_index += 1))
   done
 
-  expected_uri="spiffe://poc.example/ns/$zone/sa/zone-gateway"
+  expected_uri="spiffe://poc.example/ns/$zone/sa/$gateway_service_account"
   verify_spiffe_gateway_leaf "$bundle_file" "$chain_dir/chain-1.pem" "$intermediates_file" "$expected_uri"
   leaf_serial="$(openssl x509 -in "$chain_dir/chain-1.pem" -noout -serial | cut -d= -f2)"
   not_after="$(openssl x509 -in "$chain_dir/chain-1.pem" -noout -enddate | cut -d= -f2-)"

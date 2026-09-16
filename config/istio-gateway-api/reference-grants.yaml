@@ -1,0 +1,29 @@
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: remote-gateway-only
+  namespace: zone-a
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: zone-b
+  to:
+    - group: ""
+      kind: Service
+      name: zone-gateway-istio
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: remote-gateway-only
+  namespace: zone-b
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: zone-a
+  to:
+    - group: ""
+      kind: Service
+      name: zone-gateway-istio

@@ -11,7 +11,7 @@ fi
 export PATH="$repo_root/.tools/bin:$PATH"
 
 mode="${MODE:-${1:-}}"
-case "$mode" in standalone|istio) ;; *) printf 'MODE must be standalone or istio\n' >&2; exit 2 ;; esac
+case "$mode" in standalone|istio|istio-gateway-api) ;; *) printf 'MODE must be standalone, istio, or istio-gateway-api\n' >&2; exit 2 ;; esac
 state_dir="$repo_root/.state/$mode"
 requested_kubeconfig="${KUBECONFIG:-}"
 mkdir -p "$state_dir"
@@ -116,7 +116,11 @@ kubectl -n spire-system rollout status daemonset/spire-agent --timeout=5m
 kubectl -n spire-system rollout status daemonset/spire-spiffe-csi-driver --timeout=5m
 kubectl -n spire-system wait --for=condition=Ready pod/spire-server-0 --timeout=5m
 
-kubectl apply -f "$repo_root/config/spire/gateway-clusterspiffeid.yaml"
+if [[ "$mode" == istio-gateway-api ]]; then
+  kubectl apply -f "$repo_root/config/istio-gateway-api/gateway-clusterspiffeid.yaml"
+else
+  kubectl apply -f "$repo_root/config/spire/gateway-clusterspiffeid.yaml"
+fi
 if [[ -d "$repo_root/config/crd" ]]; then
   kubectl apply -f "$repo_root/config/crd"
 fi
@@ -132,12 +136,22 @@ if [[ "$mode" == standalone ]]; then
   "$repo_root/scripts/render-envoy.sh" --zone zone-b --configmap --output "$state_dir/zone-b-envoy.yaml" --validate
   kubectl apply -f "$state_dir/zone-a-envoy.yaml" -f "$state_dir/zone-b-envoy.yaml"
 else
+  if [[ "$mode" == istio-gateway-api ]]; then
+    # Install the pinned standard channel before Istiod starts discovery.
+    curl --fail --location --retry 3 --silent --show-error \
+      "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml" \
+      -o "$state_dir/gateway-api-crds.yaml"
+    kubectl apply --server-side -f "$state_dir/gateway-api-crds.yaml"
+    for crd in gatewayclasses gateways httproutes referencegrants; do
+      kubectl wait --for=condition=Established "crd/$crd.gateway.networking.k8s.io" --timeout=120s
+    done
+  fi
   istioctl="${ISTIOCTL:-$repo_root/.tools/bin/istioctl}"
   [[ -x "$istioctl" ]] || { printf 'istioctl %s is missing; run make tools first\n' "$istioctl" >&2; exit 1; }
   "$istioctl" install -y -f "$repo_root/config/istio/istio-operator.yaml"
   kubectl -n istio-system rollout status deployment/istiod --timeout=5m
   # Establish deny-by-default policy before any Istio gateway is created.
-  kubectl apply -f "$repo_root/config/istio/default-authorization-policies.yaml"
+  kubectl apply -f "$repo_root/config/$mode/default-authorization-policies.yaml"
 fi
 
 # Install the create-name admission guard before the Role grants CREATE. This
@@ -154,6 +168,10 @@ kubectl apply -k "$repo_root/deploy/$mode"
 kubectl -n control-plane rollout status deployment/zone-trust-controller --timeout=5m
 kubectl -n zone-a rollout status deployment/zone-app --timeout=5m
 kubectl -n zone-b rollout status deployment/zone-app --timeout=5m
-kubectl -n zone-a rollout status deployment/zone-gateway --timeout=5m
-kubectl -n zone-b rollout status deployment/zone-gateway --timeout=5m
+if [[ "$mode" == istio-gateway-api ]]; then
+  "$repo_root/scripts/check-gateway-api.sh"
+else
+  kubectl -n zone-a rollout status deployment/zone-gateway --timeout=5m
+  kubectl -n zone-b rollout status deployment/zone-gateway --timeout=5m
+fi
 "$repo_root/scripts/verify-svids.sh" "$mode"

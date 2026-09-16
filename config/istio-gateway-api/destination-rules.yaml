@@ -1,0 +1,33 @@
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: zone-b-gateway-mtls
+  namespace: zone-a
+spec:
+  host: zone-gateway-istio.zone-b.svc.cluster.local
+  trafficPolicy:
+    portLevelSettings:
+      - port: { number: 8443 }
+        connectionPool:
+          http:
+            maxRequestsPerConnection: 1
+        tls:
+          mode: ISTIO_MUTUAL
+          subjectAltNames: [spiffe://poc.example/ns/zone-b/sa/zone-gateway-istio]
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: zone-a-gateway-mtls
+  namespace: zone-b
+spec:
+  host: zone-gateway-istio.zone-a.svc.cluster.local
+  trafficPolicy:
+    portLevelSettings:
+      - port: { number: 8443 }
+        connectionPool:
+          http:
+            maxRequestsPerConnection: 1
+        tls:
+          mode: ISTIO_MUTUAL
+          subjectAltNames: [spiffe://poc.example/ns/zone-a/sa/zone-gateway-istio]
